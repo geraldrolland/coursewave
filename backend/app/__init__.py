@@ -1,0 +1,1 @@
+"""CourseWave student service package."""
