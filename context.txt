@@ -1,0 +1,344 @@
+Objective
+- Add authentication, CORS, GET caching, rate limiting, and refresh-token handling to the renamed backend/, remove gateway proxy-signature verification, and preserve the existing student registration flow.
+Requirements
+- Authentication middleware must reference api_gateway/src/middleware/auth.ts.
+- CORS middleware must reference the gateway CORS configuration.
+- Cache only GET requests; cache key is URL path plus query string; TTL is 7 minutes (420 seconds).
+- Rate limiting must reference the gateway middleware and implementations.
+- Refresh-token handling must reference POST /auth/api/v1/token-refresh in the gateway.
+- Remove CheckProxySignatureMiddleware.
+- Do not start Docker Desktop; update and validate without running containers.
+- Preserve existing student registration behavior.
+Decisions
+- Database is now coursewave_db.
+- Compose build context is ./backend; service name remains student-service so http://student-service:8000 stays valid.
+- Backend imports use canonical app.* paths, including app.services.student.*.
+- Refresh-token requirement is ambiguous: gateway reference is a handler/route, not ASGI middleware. It should likely become a FastAPI route unless the user explicitly wants request-time middleware.
+Work State
+Completed
+- Renamed student-service to backend; updated imports, tests, docs, and Compose.
+- Changed PostgreSQL database from student_db to coursewave_db.
+- Repaired malformed backend/app/services/student/exception/__init__.py.
+- Verified backend imports successfully.
+- pytest: 45 passed.
+- docker compose config --quiet: passes.
+- Existing student registration with Redis token and transactional outbox remains implemented.
+Active
+- Middleware expansion has been inspected and planned only; no middleware/config changes have been applied yet.
+- Current backend still contains CheckProxySignatureMiddleware and proxy-related settings.
+Blocked
+- Runtime/Docker validation remains unavailable because Docker Desktop is not running and the user asked not to start it.
+- Existing postgres_data volume may still contain only student_db; coursewave_db will require manual creation or volume recreation.
+Next Move
+1. Add settings for JWT, cookie signing, CORS, cache, rate limiting, and auth exclusions; remove backend proxy settings.
+2. Add PyJWT to backend/requirements.txt and implement JWT plus Express-compatible signed-cookie helpers.
+3. Implement auth middleware with Redis session lookup.
+4. Add Starlette CORSMiddleware configuration matching gateway environment variables.
+5. Implement GET cache middleware with Redis, 7-minute TTL, path/query key, safe response handling, and fail-open behavior.
+6. Port fixed-window and token-bucket rate limiting with gateway-compatible headers and 429 responses.
+7. Implement POST /auth/api/v1/token-refresh route if confirmed as the intended refresh design.
+8. Remove CheckProxySignatureMiddleware, signature settings/env values, signature tests, and README references.
+9. Add middleware tests, update existing tests, run pytest, and run docker compose config --quiet.
+Relevant Files
+- C:\Users\USER\CourseWave\backend\app\main.py: middleware registration and app lifespan.
+- C:\Users\USER\CourseWave\backend\app\base_config.py: add JWT/CORS/cache/rate-limit settings; remove proxy settings.
+- C:\Users\USER\CourseWave\backend\app\middleware\check_proxy_signature.py: to be removed.
+- C:\Users\USER\CourseWave\backend\app\middleware\request_logger.py: remove proxy-error-specific logic.
+- C:\Users\USER\CourseWave\backend\app\redis_config\__init__.py: shared async Redis client.
+- C:\Users\USER\CourseWave\backend\app\security.py: extend with JWT and cookie-signing helpers.
+- C:\Users\USER\CourseWave\backend\app\services\student\router\student.py: registration route and public-path behavior.
+- C:\Users\USER\CourseWave\backend\tests\conftest.py: settings/client fixtures need middleware configuration.
+- C:\Users\USER\CourseWave\backend\tests\helpers.py: currently only proxy-signature helpers; replace with auth/refresh helpers.
+- C:\Users\USER\CourseWave\backend\tests\test_register.py: remove signature headers; avoid cache/rate-limit test interference.
+- C:\Users\USER\CourseWave\backend\requirements.txt: add pyjwt.
+- C:\Users\USER\CourseWave\docker-compose.yml: update backend env vars and remove proxy verification settings.
+- C:\Users\USER\CourseWave\api_gateway\src\middleware\auth.ts: JWT/session reference.
+- C:\Users\USER\CourseWave\api_gateway\src\middleware\ratelimit\ and fixedWindow.ts/tokenBucket.ts: rate-limit reference.
+- C:\Users\USER\CourseWave\api_gateway\src\handlers\refreshToken.ts: refresh flow reference.
+Important Context
+- Gateway auth verifies Bearer HS256 JWT, requires type == "access", reads sessionId, then loads Redis key session:<sessionId> containing {userId, role, email}.
+- Gateway refresh uses signed cookie refresh=s:<JWT>.<HMAC-SHA256 base64 without padding> with COOKIE_SECRET; JWT uses JWT_SECRET, requires type == "refresh", extends Redis session TTL to 604800, issues new access/refresh tokens with the same session ID, and returns {accessToken}.
+- Refresh cookie attributes: HttpOnly, Secure, SameSite=Strict, Path=/auth/api/v1/token-refresh, Max-Age=604800.
+- Gateway rate limiting uses Redis keys ratelimit:fixed:<route>:<identifier> and ratelimit:bucket:<route>:<identifier>, keyed by userId when authenticated otherwise IP; fixed window uses INCR/EXPIRE; token bucket uses a Redis Lua script.
+- Gateway rate-limit headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset; 429 includes Retry-After and {"error":"Too many requests, please try again later"}.
+- Gateway CORS env vars: CORS_ORIGIN, CORS_METHODS, CORS_HEADERS, CORS_CREDENTIALS; default origin *, credentials false.
+- Gateway injects an unsigned session cookie containing URL-encoded session JSON into proxied requests.
+- URL-only cache keys can expose authenticated GET data across users; restrict caching to public responses or clarify whether authenticated GETs must be cached.
+- Removing proxy signature verification leaves backend port 8000 directly reachable when published; auth does not protect excluded paths such as registration.
+- api_gateway/src/middleware/ratelimit/index.ts and its test currently have uncommitted changes removing the /api/video token-bucket mapping.
+- Root C:\Users\USER\CourseWave is not a git repository; api_gateway is its own repository.
++Thought · 10.4s
+→Explored: 14 reads
++Thought · 1m 4s
+→Explored: 5 reads, 1 search
++Thought · 2.1s
+$ cd backend && .\.venv\Scripts\python.exe -c "import importlib.util; print('pyjwt', bool(importlib…
+pyjwt False
+fakeredis False
+→Explored: 2 reads
++Thought · 41.0s
+# Questions
+The gateway implements token refresh as a route, `POST /auth/api/v1/token-refresh`, not as middleware. Which backend shape do you want?
+create a refresh token middleware which check if the request path is the same as auth/api/refresh-token and method is POST if true execute the refresh logic else call the next middleware
+A URL-only cache key cannot distinguish users. Caching authenticated GET responses by URL can leak one user's data to another. How should the cache middleware behave?
+Public GETs only (Recommended)
+The gateway returns `{"error": "..."}` for auth, rate-limit, and refresh failures; the backend currently returns FastAPI-style `{"detail": "..."}`. Which should the new code use?
+Use `{detail: ...}`
+Behind the gateway, the backend only sees the gateway container's IP. A socket-IP limiter would put all unauthenticated traffic into one shared bucket. How should the rate limiter identify anonymous clients?
+delete the gateway service after the update
++Thought · 17.4s
+# Questions
+What exactly does "delete the gateway service" mean for this change?
+delete the api gateway folder and also remove the service from the compose include the coursewave as a service and add rabbitmq as one of it dependency
+With the gateway gone, which host port should the backend be published on?
+Map 3000:8000 (Recommended)
+Should the Compose service name be renamed now that the gateway's `http://student-service:8000` reference is going away?
+Rename to backend (Recommended)
++Thought · 6.3s
+$ Get-ChildItem -Force | Select-Object Name, Mode, Length | Format-Table -AutoSize
+Name               Mode   Length
+----               ----   ------
+api_gateway        d-----       
+backend            d-----       
+.env.example       -a---- 138   
+docker-compose.yml -a---- 4936
+→Explored: 2 searches
++Thought · 16.4s
+# Questions
+You selected `backend`, but also said "include the coursewave as a service." Which service layout do you want?
+Rename app service to coursewave
+The backend's outbox model has no Kafka publisher code yet. How should RabbitMQ be added?
+Replace Kafka with RabbitMQ
++Thought · 1m 22s
+I’m in Plan mode, so no files were changed. Switch to Build mode when you want me to implement this.
+Confirmed decisions
+- Delete the entire api_gateway/ directory.
+- Compose service becomes coursewave, builds ./backend, publishes 3000:8000, and depends on Redis, PostgreSQL, and RabbitMQ.
+- Kafka is removed; RabbitMQ replaces it.
+- Refresh is an ASGI middleware that handles POST /auth/api/v1/token-refresh and otherwise calls the next middleware.
+- Cache only public GETs (no Authorization, no Cookie, no authenticated session).
+- New error responses use {"detail": "..."}.
+- Anonymous rate limiting uses the socket IP because the gateway no longer exists.
+1. Configuration and security helpers
+backend/app/base_config.py
+Remove:
+- proxy_secret
+- proxy_signature_ttl_seconds
+Add:
+Setting	Default
+jwt_secret	change-me-in-production
+cookie_secret	change-me-in-production
+access_token_expiry	7m
+refresh_token_expiry	7d
+refresh_token_max_age_seconds	604800
+auth_exclude_paths	/health,/auth/api/v1/token-refresh,/student/api/v1/login,/student/api/v1/register,/student/api/v1/email,/student/api/v1/password-reset,/student/api/v1/verify-email
+cors_origin	*
+cors_methods	GET,POST,PUT,PATCH,DELETE,OPTIONS
+cors_headers	Content-Type,Authorization,X-Request-ID
+cors_credentials	false
+cache_enabled	true
+cache_ttl_seconds	420
+cache_exclude_paths	/health
+rate_limit_enabled	true
+rate_limit_window_ms	900000
+rate_limit_max	100
+rate_limit_exclude_paths	/health
+rate_limit_routes	[] (JSON list of per-prefix strategy overrides)
+Add helpers to split comma-separated values safely.
+backend/requirements.txt
+- Add pyjwt>=2.9,<3.
+backend/app/security.py
+Keep Argon2 helpers and add:
+- parse_duration("7m") supporting ms/s/m/h/d/w, bare numbers treated as milliseconds like jsonwebtoken.
+- create_access_token(session_id, settings).
+- create_refresh_token(session_id, settings).
+- decode_token(token, settings) using HS256 only, validating expiry.
+- sign_cookie_value(value, secret).
+- unsign_cookie_value(signed_value, secret) -> str | None.
+Cookie signing must be Express-compatible:
+s:<value>.<base64(HMAC-SHA256(secret, value)) without "=" padding>
+Cookie values must be URL-decoded before unsigning because Express URL-encodes : and +.
+2. Middleware
+Order
+add_middleware is LIFO, so register in this order:
+Cache
+RefreshToken
+RateLimit
+Auth
+RequestLogger
+CORS
+Effective request flow:
+CORS → RequestLogger → Auth → RateLimit → RefreshToken → Cache → routes
+This ensures:
+- CORS preflight never hits auth.
+- 401/429/refresh responses are logged.
+- Rate limiting sees the authenticated user.
+- Refresh is rate-limited but skips auth.
+- Cache runs only for public GETs.
+Auth — backend/app/middleware/auth.py
+Port api_gateway/src/middleware/auth.ts:
+1. Skip configured excluded paths.
+2. Require Authorization: Bearer <token>.
+3. Verify HS256 JWT with JWT_SECRET.
+4. Require type == "access".
+5. Require non-empty sessionId.
+6. Load Redis key session:<sessionId>.
+7. Store the parsed session in scope["state"]["user"].
+Responses:
+Condition	Status	Detail
+Missing/malformed header	401	Missing or invalid Authorization header
+Invalid/expired JWT	401	Invalid or expired token
+Wrong token type	401	Invalid token type
+Missing session ID	401	Invalid token payload
+Session missing	401	Session expired or not found
+Redis/unexpected failure	500	Authentication service unavailable
+CORS — backend/app/middleware/cors.py
+Configure Starlette CORSMiddleware using the same env names and parsing rules as the gateway:
+- CORS_ORIGIN: *, one origin, or comma-separated list.
+- CORS_METHODS
+- CORS_HEADERS
+- CORS_CREDENTIALS
+Also expose:
+X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining,
+X-RateLimit-Reset, Retry-After, X-Cache
+Cache — backend/app/middleware/cache.py
+- Only GET.
+- Skip when any of these are true:
+- path is excluded (/health by default)
+- Authorization header exists
+- Cookie header exists
+- scope["state"]["user"] is populated
+- Key: cache:<path> plus ?<raw query string> when present.
+- TTL: 420 seconds.
+- Add X-Cache: HIT / MISS.
+- Cache only 200 responses without:
+- Set-Cookie
+- Cache-Control: no-store or private
+- Vary: *
+- Buffer only responses up to 1 MiB; do not cache streaming responses.
+- Store status, headers, and base64-encoded body as JSON.
+- Fail open on any Redis error.
+- Do not cache authenticated or cookie-bearing responses, preventing cross-user leakage.
+Rate limiting — backend/app/middleware/ratelimit/
+Mirror the gateway package:
+ratelimit/__init__.py       route matching, identifier, headers, middleware
+ratelimit/fixed_window.py   Redis INCR/EXPIRE implementation
+ratelimit/token_bucket.py   Redis Lua token bucket
+ratelimit/utils.py          identifier/header helpers
+Behavior:
+- Identifier: session userId when authenticated, otherwise socket IP (scope["client"][0]).
+- Longest-prefix route matching; global fallback uses fixed window.
+- Fixed-window keys: ratelimit:fixed:<route>:<identifier>.
+- Token-bucket keys: ratelimit:bucket:<route>:<identifier>.
+- Headers:
+X-RateLimit-Limit
+X-RateLimit-Remaining
+X-RateLimit-Reset
+Retry-After        # 429 only
+- 429 body:
+{"detail": "Too many requests, please try again later"}
+- Skip /health.
+- Fail open on Redis errors, matching gateway behavior.
+Refresh — backend/app/middleware/refresh_token.py
+This is an ASGI middleware, not a FastAPI route.
+Condition:
+scope["type"] == "http"
+scope["method"] == "POST"
+scope["path"].rstrip("/") == "/auth/api/v1/token-refresh"
+Flow:
+1. Read the refresh cookie.
+2. Require the s: signed-cookie prefix and verify HMAC with COOKIE_SECRET.
+3. Verify the refresh JWT with JWT_SECRET.
+4. Require type == "refresh" and sessionId.
+5. Require session:<sessionId> in Redis.
+6. Extend the session TTL to 604800 seconds.
+7. Issue a new access token and refresh token for the same session ID.
+8. Set a new signed refresh cookie:
+HttpOnly; Secure; SameSite=Strict;
+Path=/auth/api/v1/token-refresh; Max-Age=604800
+ 9. Return 200 {"accessToken": "<new-access-token>"}.
+10. If the path does not match, call the next middleware.
+Errors:
+Condition	Status	Detail
+Missing/unsigned cookie	401	Missing refresh token
+Wrong token type	401	Invalid token type
+Missing session ID	401	Invalid refresh token payload
+Session missing	401	Session expired or not found
+Invalid/expired JWT	401	Invalid or expired refresh token
+Unexpected failure	500	Token refresh failed
+I’ll use /auth/api/v1/token-refresh because that is the gateway endpoint. If you actually want /auth/api/refresh-token, tell me before implementation.
+3. Remove proxy-signature verification
+- Delete backend/app/middleware/check_proxy_signature.py.
+- Delete backend/tests/test_proxy_signature.py.
+- Remove proxy_error handling from request_logger.py.
+- Remove proxy settings from .env.example, Compose, and README.
+- Remove signature headers from test_register.py; registration becomes a normally excluded public path.
+- Remove signature helper functions from tests/helpers.py.
+- Update test_request_logger.py; replace the signature rejection test with an auth rejection test.
+- Keep the gateway untouched only long enough to read it; it will be deleted after backend validation.
+4. Remove the gateway and update Compose
+Delete
+C:\Users\USER\CourseWave\api_gateway\
+This is destructive: it removes that directory’s own .git repository and any uncommitted changes.
+docker-compose.yml
+- Remove api-gateway.
+- Remove kafka and kafka_data.
+- Rename student-service → coursewave.
+- Publish 3000:8000.
+- Add rabbitmq using rabbitmq:4-management-alpine.
+- Add rabbitmq_data.
+- Make coursewave depend on Redis, PostgreSQL, and RabbitMQ.
+- Remove all Kafka env vars.
+- Add backend env vars:
+JWT_SECRET, COOKIE_SECRET, ACCESS_TOKEN_EXPIRY, REFRESH_TOKEN_EXPIRY,
+REFRESH_TOKEN_MAX_AGE_SECONDS, AUTH_EXCLUDE_PATHS,
+CORS_ORIGIN, CORS_METHODS, CORS_HEADERS, CORS_CREDENTIALS,
+CACHE_ENABLED, CACHE_TTL_SECONDS,
+RATE_LIMIT_ENABLED, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX, RATE_LIMIT_ROUTES,
+RABBITMQ_URL
+- Expose RabbitMQ ports 5672 and 15672.
+- Health check: rabbitmq-diagnostics -q ping.
+.env.example files
+- Root: remove PROXY_SECRET; keep JWT/cookie secrets; add RabbitMQ credentials.
+- Backend: replace proxy variables with the new auth/CORS/cache/rate-limit settings.
+backend/README.md
+Rewrite the gateway/signature sections and document:
+- Backend is now the public API on port 3000.
+- Middleware order.
+- JWT + Redis session contract.
+- Refresh endpoint and cookie attributes.
+- Cache and rate-limit behavior.
+- Registration remains public.
+- Compose now starts coursewave, Redis, PostgreSQL, and RabbitMQ.
+5. Tests
+Add shared fakes/helpers:
+- tests/fakes.py: async FakeRedis supporting get, set, delete, incr, expire, ttl, eval, aclose, and failure injection.
+- tests/helpers.py: access/refresh JWT creation, session seeding, signed-cookie generation, auth headers.
+New tests:
+- tests/test_auth.py: excluded paths, missing/malformed token, wrong type, missing session, success, Redis failure.
+- tests/test_cors.py: simple request, preflight, disallowed origin, credentials.
+- tests/test_cache.py: GET hit/miss, query-string separation, TTL 420, POST bypass, authenticated/cookie bypass, control of non-200 responses, Redis fail-open, X-Cache.
+- tests/test_rate_limit.py: fixed-window 429 and headers, user-vs-IP keying, token-bucket allowed/denied, per-route config, /health exclusion, Redis fail-open.
+- tests/test_refresh.py: missing/unsigned/tampered cookie, wrong type, expired token, missing session, success response, cookie attributes, session TTL extension.
+Update:
+- tests/conftest.py: test JWT/cookie secrets, fake Redis, long rate limit.
+- tests/test_register.py: remove signature headers and the signature-required test.
+- tests/test_request_logger.py: remove signature-specific assertions.
+Expected result: all tests pass, including the existing registration/outbox/schema tests.
+6. Validation
+After implementation:
+cd C:\Users\USER\CourseWave\backend
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -c "from app.main import app; print(app.title)"
+cd C:\Users\USER\CourseWave
+docker compose config --quiet
+docker compose config
+I will not start Docker Desktop or any containers.
+Important notes
+- No token issuer exists in this repo. Auth validates access tokens and refresh rotates existing sessions, but there is still no login endpoint that creates the initial JWT/session. That remains a separate feature.
+- Registration stays public and unchanged.
+- Direct public access now means auth, CORS, and rate limiting are enforced only by the backend.
+- Anonymous rate limiting uses the real client IP because the gateway is gone. If you later put nginx or another proxy in front, we would need a trusted X-Forwarded-For setting.
+- Deleting api_gateway/ permanently removes its git history and uncommitted changes.
+Switch to Build mode and I’ll implement this in that order.
