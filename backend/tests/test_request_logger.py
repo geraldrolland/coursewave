@@ -7,8 +7,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.base_config import Settings
-from app.middleware.check_proxy_signature import CheckProxySignatureMiddleware
+from app.middleware.auth import AuthMiddleware
 from app.middleware.request_logger import RequestLoggerMiddleware
+from tests.fakes import FakeRedis
 
 
 class CapturingLogger:
@@ -33,7 +34,12 @@ def _build_app(
         return {"ok": True}
 
     if protect:
-        app.add_middleware(CheckProxySignatureMiddleware, settings=settings)
+        redis = FakeRedis()
+        app.add_middleware(
+            AuthMiddleware,
+            settings=settings,
+            redis_provider=lambda: redis,
+        )
     if logger is not None:
         app.add_middleware(RequestLoggerMiddleware, logger=logger)
     return app
@@ -73,24 +79,26 @@ def test_generates_request_id_when_missing(settings: Settings) -> None:
     assert logger.entries[0]["extra"]["fields"]["request_id"] == request_id
 
 
-def test_logs_signature_rejection(settings: Settings) -> None:
+def test_logs_auth_rejection(settings: Settings) -> None:
     logger = CapturingLogger()
     app = _build_app(settings, logger, protect=True)
 
     with TestClient(app) as client:
-        response = client.get("/test", headers={"x-request-id": "req-403"})
+        response = client.get("/test", headers={"x-request-id": "req-401"})
 
-    assert response.status_code == 403
-    assert response.json() == {"detail": "Missing proxy signature headers"}
+    assert response.status_code == 401
+    assert response.json() == {
+        "detail": "Missing or invalid Authorization header"
+    }
 
     entry = logger.entries[0]
-    assert entry["message"] == "Missing proxy signature headers"
+    assert entry["message"] == "Request failed"
     fields = entry["extra"]["fields"]
     assert fields["method"] == "GET"
     assert fields["path"] == "/test"
-    assert fields["status_code"] == 403
-    assert fields["message"] == "Missing proxy signature headers"
-    assert fields["request_id"] == "req-403"
+    assert fields["status_code"] == 401
+    assert fields["message"] == "Request failed"
+    assert fields["request_id"] == "req-401"
 
 
 def test_logs_not_found_as_failed(settings: Settings) -> None:

@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
 
-from app.base_config import Settings
 from app.base_dependencies import get_session
 from app.main import create_app
 from app.security import verify_password
@@ -18,7 +17,8 @@ from app.services.student.router.student import (
     VERIFICATION_TOKEN_TTL_SECONDS,
     build_verification_link,
 )
-from tests.helpers import TEST_PROXY_SECRET, signed_headers
+from tests.fakes import FakeRedis
+from tests.helpers import build_settings
 
 REGISTER_PATH = "/student/api/v1/register"
 
@@ -77,31 +77,6 @@ class FakeSession:
         return FakeTransaction(self)
 
 
-class FakeRedis:
-    """In-memory subset of the async Redis client used by registration."""
-
-    def __init__(self, set_error: Exception | None = None) -> None:
-        self.values: dict[str, str] = {}
-        self.ttls: dict[str, int | None] = {}
-        self.deleted: list[str] = []
-        self.set_error = set_error
-
-    async def set(self, key: str, value: str, ex: int | None = None) -> None:
-        if self.set_error is not None:
-            raise self.set_error
-
-        self.values[key] = value
-        self.ttls[key] = ex
-
-    async def delete(self, key: str) -> None:
-        self.deleted.append(key)
-        self.values.pop(key, None)
-        self.ttls.pop(key, None)
-
-    async def aclose(self) -> None:
-        return None
-
-
 @contextmanager
 def registration_client(
     session: FakeSession,
@@ -110,15 +85,13 @@ def registration_client(
 ) -> Iterator[TestClient]:
     """Create an app with fake database and Redis dependencies."""
 
-    settings = Settings(
-        proxy_secret=TEST_PROXY_SECRET,
-        proxy_signature_ttl_seconds=30,
-        log_level="CRITICAL",
+    settings = build_settings(
         app_host=app_host,
         auto_create_tables=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
     )
-    app = create_app(settings)
-    app.state.redis = redis
+    app = create_app(settings, redis_client=redis)  # type: ignore[arg-type]
 
     async def override_get_session() -> AsyncIterator[FakeSession]:
         yield session
@@ -145,7 +118,6 @@ def test_registration_creates_student_outbox_and_verification_token() -> None:
         response = client.post(
             REGISTER_PATH,
             json=VALID_PAYLOAD,
-            headers=signed_headers("POST", REGISTER_PATH),
         )
 
     assert response.status_code == 201
@@ -200,7 +172,6 @@ def test_registration_uses_https_app_host_when_provided() -> None:
         response = client.post(
             REGISTER_PATH,
             json=VALID_PAYLOAD,
-            headers=signed_headers("POST", REGISTER_PATH),
         )
 
     assert response.status_code == 201
@@ -224,7 +195,6 @@ def test_duplicate_email_returns_409_and_rolls_back() -> None:
         response = client.post(
             REGISTER_PATH,
             json=VALID_PAYLOAD,
-            headers=signed_headers("POST", REGISTER_PATH),
         )
 
     assert response.status_code == 409
@@ -238,13 +208,13 @@ def test_duplicate_email_returns_409_and_rolls_back() -> None:
 
 def test_redis_failure_returns_503_and_rolls_back() -> None:
     session = FakeSession()
-    redis = FakeRedis(set_error=RedisError("redis unavailable"))
+    redis = FakeRedis()
+    redis.fail("set", RedisError("redis unavailable"))
 
     with registration_client(session, redis) as client:
         response = client.post(
             REGISTER_PATH,
             json=VALID_PAYLOAD,
-            headers=signed_headers("POST", REGISTER_PATH),
         )
 
     assert response.status_code == 503
@@ -257,19 +227,6 @@ def test_redis_failure_returns_503_and_rolls_back() -> None:
     assert redis.values == {}
 
 
-def test_registration_requires_gateway_signature() -> None:
-    session = FakeSession()
-    redis = FakeRedis()
-
-    with registration_client(session, redis) as client:
-        response = client.post(REGISTER_PATH, json=VALID_PAYLOAD)
-
-    assert response.status_code == 403
-    assert response.json() == {"detail": "Missing proxy signature headers"}
-    assert session.added == []
-    assert redis.values == {}
-
-
 def test_invalid_registration_payload_returns_422_without_writes() -> None:
     session = FakeSession()
     redis = FakeRedis()
@@ -279,7 +236,6 @@ def test_invalid_registration_payload_returns_422_without_writes() -> None:
         response = client.post(
             REGISTER_PATH,
             json=payload,
-            headers=signed_headers("POST", REGISTER_PATH),
         )
 
     assert response.status_code == 422

@@ -1,24 +1,22 @@
 # CourseWave Backend
 
-FastAPI backend for the CourseWave platform. The student service accepts
-requests forwarded by the CourseWave API Gateway and enforces the gateway's
-HMAC request signature before allowing access to protected routes.
+FastAPI service for the CourseWave platform. It is the public API on port
+`3000` and enforces authentication, CORS, response caching, and rate limiting
+directly.
 
 ## Features
 
-- HMAC-SHA256 verification of `x-proxy-signature`.
-- Millisecond timestamp validation with a 30-second tolerance.
-- Replay protection by rejecting stale and future-dated signatures.
-- `X-REQUEST-ID` propagation for distributed tracing.
-- Structured JSON request logs with method, path, status code, message, and
-  request ID.
-- `/health` endpoint exempt from proxy-signature checks.
+- Bearer JWT authentication with Redis-backed sessions.
+- Refresh-token rotation through signed cookies.
+- CORS with the same configuration names the former gateway used.
+- Redis caching for public JSON `GET` responses with a 7-minute TTL.
+- Redis fixed-window and token-bucket rate limiting selected by route strategy.
+- `X-REQUEST-ID` propagation and structured JSON request logs.
 - FastAPI-standard error responses: `{"detail": "..."}`.
-- SQLModel-based PostgreSQL access through an async request-scoped session
-  dependency.
 - Validated student registration with Argon2 password hashing.
 - Redis-backed email verification tokens with a 120-second TTL.
 - Transactional outbox events for asynchronous email delivery.
+- PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
 
@@ -30,32 +28,27 @@ backend/
 │   ├── logging_config.py
 │   ├── security.py
 │   ├── base_dependencies/
-│   │   └── __init__.py
 │   ├── base_utils/
-│   │   └── __init__.py
 │   ├── db_config/
-│   │   └── __init__.py
 │   ├── middleware/
-│   │   ├── check_proxy_signature.py
+│   │   ├── auth.py
+│   │   ├── cache.py
+│   │   ├── cors.py
+│   │   ├── ratelimit/
+│   │   │   ├── __init__.py
+│   │   │   ├── fixed_window.py
+│   │   │   ├── ratelimiter_registry.py
+│   │   │   ├── token_bucket.py
+│   │   │   └── utils.py
+│   │   ├── refresh_token.py
 │   │   └── request_logger.py
 │   ├── redis_config/
-│   │   └── __init__.py
 │   └── services/
-│       ├── __init__.py
 │       └── student/
-│           ├── __init__.py
 │           ├── exception/
-│           │   └── __init__.py
 │           ├── model/
-│           │   ├── __init__.py
-│           │   ├── base.py
-│           │   ├── outbox.py
-│           │   └── student.py
 │           ├── router/
-│           │   ├── __init__.py
-│           │   └── student.py
 │           └── schema/
-│               └── __init__.py
 ├── tests/
 ├── .env.example
 ├── requirements.txt
@@ -67,8 +60,8 @@ backend/
 ### Prerequisites
 
 - Python 3.12+
-- The same `PROXY_SECRET` configured in the API gateway
-- PostgreSQL and Redis when running the service outside Docker Compose
+- PostgreSQL and Redis when running outside Docker Compose
+- RabbitMQ is part of the Compose stack for outbox delivery
 
 ### Installation
 
@@ -85,8 +78,23 @@ Copy-Item .env.example .env
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PROXY_SECRET` | Shared secret used by the gateway to sign requests | `change-me-in-production` |
-| `PROXY_SIGNATURE_TTL_SECONDS` | Allowed timestamp tolerance | `30` |
+| `JWT_SECRET` | HS256 secret used to sign access and refresh tokens | `change-me-in-production` |
+| `COOKIE_SECRET` | Secret used to sign the refresh cookie | `change-me-in-production` |
+| `ACCESS_TOKEN_EXPIRY` | Access-token lifetime (`ms`, `s`, `m`, `h`, `d`, `w`) | `7m` |
+| `REFRESH_TOKEN_EXPIRY` | Refresh-token lifetime | `7d` |
+| `REFRESH_TOKEN_MAX_AGE_SECONDS` | Redis session TTL extension and cookie `Max-Age` | `604800` |
+| `AUTH_EXCLUDE_PATHS` | Comma-separated public paths | see `.env.example` |
+| `CORS_ORIGIN` | `*`, one origin, or a comma-separated list | `*` |
+| `CORS_METHODS` | Comma-separated allowed methods | `GET,POST,PUT,PATCH,DELETE,OPTIONS` |
+| `CORS_HEADERS` | Comma-separated allowed request headers | `Content-Type,Authorization,X-Request-ID` |
+| `CORS_CREDENTIALS` | Allow credentialed CORS requests | `false` |
+| `CACHE_ENABLED` | Enable the public GET cache | `true` |
+| `CACHE_TTL_SECONDS` | Cache entry lifetime | `420` |
+| `CACHE_EXCLUDE_PATHS` | Paths that are never cached | `/health` |
+| `RATE_LIMIT_ENABLED` | Enable rate limiting | `true` |
+| `RATE_LIMIT_MAX` | Requests allowed per window for every strategy | `100` |
+| `RATE_LIMIT_EXCLUDE_PATHS` | Paths that are never rate limited | `/health` |
+| `RATELIMIT_ROUTES` | JSON list of `{prefix, window_ms, strategy}` routes | see `.env.example` |
 | `LOG_LEVEL` | Application log level | `INFO` |
 | `APP_HOST` | Public host used to build email verification links | `localhost:3000` |
 | `REDIS_HOST` | Redis host | `localhost` |
@@ -95,6 +103,7 @@ Copy-Item .env.example .env
 | `REDIS_DB` | Redis database number | `0` |
 | `AUTO_CREATE_TABLES` | Create missing SQLModel tables at startup | `false` |
 | `DATABASE_URL` | Optional SQLAlchemy database URL override | `postgresql+asyncpg://postgres:user123@localhost:5432/coursewave_db` |
+| `RABBITMQ_URL` | Broker URL used by outbox consumers | `amqp://guest:guest@localhost:5672/` |
 
 ### Run
 
@@ -104,87 +113,190 @@ Copy-Item .env.example .env
 
 ### Docker Compose
 
-The full stack is defined in the repository root:
-
 ```powershell
 cd ..
+Copy-Item .env.example .env
 docker compose up --build
 ```
 
-It starts the API gateway, backend service, Redis, PostgreSQL, and Kafka. The
-backend service uses `DATABASE_URL` to reach the `postgres` container and runs
-with `AUTO_CREATE_TABLES=true`, so the `student` and `outbox` tables are created
-on startup if they do not exist.
+Compose starts four services:
 
-## Database
+- `coursewave` - this API, published on `http://localhost:3000`
+- `postgres` - PostgreSQL with the `coursewave_db` database
+- `redis` - sessions, cache, rate-limit counters, verification tokens
+- `rabbitmq` - broker with the management UI on `http://localhost:15672`
 
-The service uses SQLModel models with SQLAlchemy's async PostgreSQL engine.
-`app/db_config/__init__.py` provides the cached engine factory and currently
-connects to:
+## Middleware
 
-| Setting | Value |
-|---------|-------|
-| Driver | `postgresql+asyncpg` |
-| Host | `localhost` |
-| Port | `5432` |
-| Database | `coursewave_db` |
-| Username | `postgres` |
-| Password | `user123` |
-
-The connection settings default to the values above. Set `DATABASE_URL` to
-override them without changing code:
+Middleware is registered in this order, and Starlette runs the last one added
+first:
 
 ```text
-DATABASE_URL=postgresql+asyncpg://postgres:user123@postgres:5432/coursewave_db
+CORS -> RequestLogger -> Auth -> RateLimit -> RefreshToken -> Cache -> routes
 ```
 
-The root `docker-compose.yml` uses this override so the service connects to the
-PostgreSQL container. Move all credentials into environment variables or a
-secrets manager before deployment.
+- CORS handles browser preflight requests before authentication.
+- Request logging covers rejected requests too.
+- Auth validates access tokens and loads the session.
+- Rate limiting can therefore key authenticated requests by user.
+- Refresh runs after rate limiting but bypasses auth for its exact path.
+- Cache runs closest to the routes and only stores public JSON GET responses.
 
-Use the request-scoped session dependency in routes:
+## Authentication
+
+Protected routes require:
+
+```http
+Authorization: Bearer <access-token>
+```
+
+The token must be an HS256 JWT signed with `JWT_SECRET` containing:
+
+```json
+{
+  "sessionId": "the-session-id",
+  "type": "access",
+  "iat": 1760000000,
+  "exp": 1760000420
+}
+```
+
+The middleware then loads `session:<sessionId>` from Redis. The value is a JSON
+document such as:
+
+```json
+{
+  "userId": "6f8c3e5e-3fbc-4f2e-8f19-3e0f6f8a9b21",
+  "role": "student",
+  "email": "ada@example.com"
+}
+```
+
+The parsed document is stored in the request state as `user`. Redis errors
+return `500` and missing or invalid sessions return `401`. Public paths are
+configured with `AUTH_EXCLUDE_PATHS`.
+
+## Token Refresh
+
+`POST /auth/api/v1/token-refresh` is handled by ASGI middleware, not a route.
+It reads the `refresh` cookie, which uses Express-compatible signing:
+
+```text
+s:<JWT>.<base64(HMAC-SHA256(COOKIE_SECRET, JWT)) without padding>
+```
+
+The refresh JWT must be signed with `JWT_SECRET`, have `type` equal to
+`"refresh"`, and carry a `sessionId` that still exists in Redis. A successful
+refresh:
+
+1. Extends `session:<sessionId>` to `REFRESH_TOKEN_MAX_AGE_SECONDS`.
+2. Issues a new access token and a new refresh token for the same session.
+3. Sets the rotated cookie with `HttpOnly; Secure; SameSite=Strict;
+   Path=/auth/api/v1/token-refresh; Max-Age=604800`.
+4. Returns `{"accessToken": "..."}`.
+
+Refresh errors use `{"detail": "..."}` with `401` or `500` status codes.
+
+## Response Cache
+
+Only `GET` responses are cached, and only when the request has no
+`Authorization` header, no `Cookie` header, and no authenticated session. This
+prevents one user's data from being served to another user.
+
+- Cache key: `cache:<path>` plus the raw query string when present.
+- TTL: `CACHE_TTL_SECONDS` (420 seconds by default).
+- Only responses whose media type is exactly `application/json` are cached.
+  Parameters such as `application/json; charset=utf-8` are allowed, but
+  `application/problem+json` and other non-JSON media types are not cached.
+- Non-JSON responses are streamed through without buffering and still receive
+  `X-Cache: MISS`.
+- Responses are cached only when they are `200` and have no `Set-Cookie`,
+  `Cache-Control: no-store`/`private`, or `Vary: *`.
+- Streaming responses and bodies over 1 MiB are not cached.
+- Redis failures fail open and never break the request.
+- The response header `X-Cache` is `HIT` or `MISS`.
+
+## Rate Limiting
+
+Rate limits are keyed by the session `userId` for authenticated requests and by
+the socket IP for anonymous requests.
+
+Routes are configured with `RATELIMIT_ROUTES`, a JSON list of dictionaries:
+
+```json
+[
+  {
+    "prefix": "/student/api",
+    "window_ms": 90000,
+    "strategy": "fixed_window"
+  },
+  {
+    "prefix": "*",
+    "window_ms": 90000,
+    "strategy": "fixed_window"
+  }
+]
+```
+
+- `prefix`: request path prefix. The longest matching non-wildcard prefix wins.
+- `window_ms`: window length in milliseconds.
+- `strategy`: registry key used to select the rate-limit handler.
+- `{"prefix": "*"}` is the fallback for paths that do not match another route.
+- If no wildcard route is configured, the middleware falls back to
+  `{"window_ms": 90000, "strategy": "fixed_window"}`.
+- `RATE_LIMIT_MAX` is the number of requests allowed per window for both
+  strategies.
+- `/health` is excluded by default.
+
+Strategy handlers live in
+`backend/app/middleware/ratelimit/ratelimiter_registry.py`:
 
 ```python
-from fastapi import Depends
-from sqlmodel.ext.asyncio.session import AsyncSession
+RATELIMITER_REGISTRY = {
+    "fixed_window": fixed_window_limit,
+    "token_bucket": token_bucket_limit,
+}
+```
 
-from app.base_dependencies import get_session
+Handlers receive the request and the route window and return a boolean:
 
-
-async def endpoint(session: AsyncSession = Depends(get_session)):
+```python
+async def fixed_window_limit(request, window_ms) -> bool:
     ...
 ```
 
-`get_session` yields one session per request, rolls back on exceptions, and
-closes the session automatically. The application lifespan disposes of the
-engine's connection pool when the service shuts down.
+The middleware binds Redis and `RATE_LIMIT_MAX` to the handler before calling
+it. Handlers also publish `limit`, `remaining`, `reset`, and `retry-after`
+metadata in the request state so the middleware can set the response headers.
 
-### Models
+- `fixed_window` uses Redis `INCR`/`EXPIRE`.
+- `token_bucket` uses a Redis Lua script. Its capacity is `RATE_LIMIT_MAX` and
+  it refills `RATE_LIMIT_MAX` tokens over `window_ms`.
+- Keys: `ratelimit:fixed_window:<prefix>:<identifier>` and
+  `ratelimit:token_bucket:<prefix>:<identifier>`.
+- Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+  `X-RateLimit-Reset`.
+- `429` responses include `Retry-After` and
+  `{"detail": "Too many requests, please try again later"}`.
+- Redis failures fail open.
+- Unknown strategies log a warning and fall back to `fixed_window`.
 
-`Student` stores the account profile and authentication data:
+## CORS
 
-- `user_id` (UUID primary key, generated automatically)
-- `first_name`, optional `middle_name`, `last_name`
-- unique, indexed `email`
-- Argon2 `password_hash`
-- `is_email_verified` (default `false`)
-- `created_at`, `updated_at`
-- optional `profile_pic_url`
+CORS uses the former gateway environment names:
 
-`Outbox` stores events that must be delivered reliably:
+- `CORS_ORIGIN`: `*`, one origin, or a comma-separated list.
+- `CORS_METHODS`: comma-separated methods.
+- `CORS_HEADERS`: comma-separated allowed request headers.
+- `CORS_CREDENTIALS`: `true` or `false`.
 
-- `id` (UUID primary key)
-- `status` (`pending`, `processed`, or `failed`)
-- optional `retry_after`
-- `num_of_retries` (default `0`)
-- `topic`
-- JSON `payload`
-- `created_at`, `updated_at`
+Exposed response headers include `X-Request-ID`, the rate-limit headers,
+`Retry-After`, and `X-Cache`.
 
 ## Student Registration
 
-`POST /student/api/v1/register` creates a student account and queues the email
-verification event. The route requires a valid gateway signature.
+`POST /student/api/v1/register` is public and unchanged. It creates a student
+account and queues the email verification event.
 
 Request body:
 
@@ -199,32 +311,13 @@ Request body:
 }
 ```
 
-Validation rules:
-
-- `first_name` and `last_name` are required and cannot be blank.
-- `middle_name` is optional; blank values are stored as `null`.
-- `email` must be valid and is normalized to lowercase.
-- Passwords must be 8-128 characters and contain uppercase, lowercase, numeric,
-  and special characters.
-- `password` and `confirm_password` must match.
-
-The endpoint performs the following work:
+The endpoint:
 
 1. Hashes the password with Argon2.
 2. Generates a URL-safe verification token and stores it in Redis with the
    student UUID as its value and a 120-second TTL.
-3. Builds `http://{APP_HOST}/email-verification?token={token}`. If `APP_HOST`
-   already includes an `http://` or `https://` scheme, that scheme is preserved.
+3. Builds `http://{APP_HOST}/email-verification?token={token}`.
 4. Inserts the `Student` and an `Outbox` row in the same database transaction.
-
-The outbox event uses topic `student.registered` and payload:
-
-```json
-{
-  "recipient_email": "ada@example.com",
-  "verification_link": "http://localhost:3000/email-verification?token=..."
-}
-```
 
 Successful response (`201 Created`):
 
@@ -242,80 +335,17 @@ Errors:
 - `503 Service Unavailable` when Redis cannot store the verification token.
 
 If the database transaction fails after the Redis token is written, the token is
-deleted on a best-effort basis. The email verification endpoint itself is not
-implemented yet; registration only creates and stores the verification link.
-
-## Gateway Signature Verification
-
-The API gateway signs each proxied request with:
-
-```text
-HMAC-SHA256(
-  key = PROXY_SECRET,
-  message = "{METHOD}:{URL}:{TIMESTAMP}"
-).hexdigest()
-```
-
-The URL is the gateway's rewritten `req.url`, including the query string. The
-timestamp is epoch milliseconds.
-
-Required headers:
-
-```http
-x-proxy-signature: <hex-digest>
-x-proxy-timestamp: <epoch-milliseconds>
-```
-
-The middleware rejects a request with `403` when:
-
-- either signature header is missing,
-- the timestamp is not a valid integer,
-- the timestamp is 30 seconds or more away from the current time,
-- the signature does not match the expected HMAC.
-
-Example error:
-
-```json
-{
-  "detail": "Invalid proxy signature"
-}
-```
-
-`GET /health` bypasses signature verification for container and load-balancer
-health checks.
-
-## Request Logging
-
-Every HTTP request produces a JSON log entry:
-
-```json
-{
-  "timestamp": "2026-10-27T00:00:00.000000+00:00",
-  "level": "INFO",
-  "logger": "student_service.request",
-  "method": "GET",
-  "path": "/health",
-  "status_code": 200,
-  "message": "Request completed",
-  "request_id": "4f3c2f0e-7f5f-4c6d-9f0a-2a6f7d1e8b21",
-  "duration_ms": 1.42
-}
-```
-
-The logger reads `X-REQUEST-ID` from the gateway and generates a UUID if the
-header is absent. The response includes `X-REQUEST-ID`.
-
-Requests rejected by the signature middleware are logged with status `403` and
-the signature error as the message.
+deleted on a best-effort basis.
 
 ## API
 
-| Method | Path | Description | Signature required |
-|--------|------|-------------|--------------------|
-| `GET` | `/health` | Health check | No |
-| `POST` | `/student/api/v1/register` | Register a student | Yes |
-| `GET` | `/docs` | FastAPI documentation | Yes |
-| `GET` | `/openapi.json` | OpenAPI schema | Yes |
+| Method | Path | Description | Authentication |
+|--------|------|-------------|----------------|
+| `GET` | `/health` | Health check | Public |
+| `POST` | `/student/api/v1/register` | Register a student | Public |
+| `POST` | `/auth/api/v1/token-refresh` | Rotate tokens | Refresh cookie |
+| `GET` | `/docs` | FastAPI documentation | Bearer token |
+| `GET` | `/openapi.json` | OpenAPI schema | Bearer token |
 
 ## Testing
 
@@ -323,11 +353,18 @@ the signature error as the message.
 .venv\Scripts\python -m pytest
 ```
 
-The tests cover valid signatures, missing headers, invalid timestamps, expired
-and future timestamps, tampered signatures, query-string signing, request-ID
-propagation, structured request logging, PostgreSQL engine configuration,
-session rollback behavior, registration validation, Argon2 password hashing,
-Redis token creation, duplicate-email handling, and transactional outbox writes.
+The suite covers authentication, CORS, caching, rate limiting, refresh-token
+rotation, request logging, PostgreSQL configuration, session cleanup,
+registration validation, password hashing, Redis token creation,
+duplicate-email handling, and transactional outbox writes.
+
+## Known Limitations
+
+- There is no login or token-issuance endpoint in this repository. Access and
+  refresh tokens must be issued by another service that creates the matching
+  Redis session.
+- RabbitMQ is provisioned in Compose, but this repository does not yet contain
+  an outbox publisher or consumer.
 
 ## License
 

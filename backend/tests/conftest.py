@@ -3,24 +3,31 @@
 from collections.abc import Iterator
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.base_config import Settings
 from app.main import create_app
-from tests.helpers import TEST_PROXY_SECRET
+from tests.fakes import FakeRedis
+from tests.helpers import build_settings
 
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(
-        proxy_secret=TEST_PROXY_SECRET,
-        proxy_signature_ttl_seconds=30,
-        log_level="CRITICAL",
-    )
+    return build_settings()
 
 
 @pytest.fixture
-def client(settings: Settings) -> Iterator[TestClient]:
-    app = create_app(settings)
+def fake_redis() -> FakeRedis:
+    return FakeRedis()
+
+
+@pytest.fixture
+def app(settings: Settings, fake_redis: FakeRedis) -> FastAPI:
+    return create_app(settings, redis_client=fake_redis)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def client(app: FastAPI) -> Iterator[TestClient]:
     with TestClient(app) as test_client:
         yield test_client

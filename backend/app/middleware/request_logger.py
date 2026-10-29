@@ -51,9 +51,9 @@ class RequestLoggerMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
         finally:
-            message = state.get("proxy_error")
-            if not message:
-                message = REQUEST_COMPLETED if status_code < 400 else REQUEST_FAILED
+            message = (
+                REQUEST_COMPLETED if status_code < 400 else REQUEST_FAILED
+            )
 
             fields: dict[str, Any] = {
                 "method": scope.get("method"),
