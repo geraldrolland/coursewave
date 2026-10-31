@@ -206,18 +206,32 @@ Only `GET` responses are cached, and only when the request has no
 `Authorization` header, no `Cookie` header, and no authenticated session. This
 prevents one user's data from being served to another user.
 
+Caching is also limited to the prefixes in `CACHE_ROUTES` in
+`backend/app/middleware/cache.py`:
+
+```python
+CACHE_ROUTES = (
+    "/student/api/v1",
+    "/instructor/api/v1",
+)
+```
+
+Paths outside those prefixes bypass Redis cache reads and writes and do not
+receive an `X-Cache` header. Prefixes match complete path segments, so
+`/student/api/v10` does not match `/student/api/v1`.
+
 - Cache key: `cache:<path>` plus the raw query string when present.
 - TTL: `CACHE_TTL_SECONDS` (420 seconds by default).
 - Only responses whose media type is exactly `application/json` are cached.
   Parameters such as `application/json; charset=utf-8` are allowed, but
   `application/problem+json` and other non-JSON media types are not cached.
-- Non-JSON responses are streamed through without buffering and still receive
-  `X-Cache: MISS`.
+- Non-JSON responses under a cache route are streamed through without buffering
+  and still receive `X-Cache: MISS`.
 - Responses are cached only when they are `200` and have no `Set-Cookie`,
   `Cache-Control: no-store`/`private`, or `Vary: *`.
 - Streaming responses and bodies over 1 MiB are not cached.
 - Redis failures fail open and never break the request.
-- The response header `X-Cache` is `HIT` or `MISS`.
+- The `X-Cache` header is `HIT` or `MISS` on cache-routed responses.
 
 ## Rate Limiting
 

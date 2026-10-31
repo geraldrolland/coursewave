@@ -15,15 +15,34 @@ from fastapi.testclient import TestClient
 
 from app.base_config import Settings
 from app.main import create_app
-from app.middleware.cache import MAX_CACHE_BODY_BYTES
+from app.middleware.cache import CACHE_ROUTES, MAX_CACHE_BODY_BYTES
 from tests.fakes import FakeRedis
 from tests.helpers import access_token, auth_headers, build_settings, seed_session
 
+CACHE_PREFIX = "/student/api/v1"
+CACHE_HEALTH_PATH = f"{CACHE_PREFIX}/health"
+CACHE_TEST_PATH_NAMES = (
+    "/health",
+    "/no-store",
+    "/private",
+    "/vary",
+    "/cookie",
+    "/large",
+    "/error",
+    "/stream",
+    "/text",
+    "/problem",
+    "/json-charset",
+    "/json-stream",
+    "/post",
+)
 TEST_CACHE_SETTINGS = {
     "cache_exclude_paths": "",
-    "auth_exclude_paths": (
-        "/health,/no-store,/private,/vary,/cookie,/large,/error,/stream,"
-        "/text,/problem,/json-charset,/json-stream"
+    "auth_exclude_paths": ",".join(
+        [
+            "/health",
+            *(f"{CACHE_PREFIX}{path}" for path in CACHE_TEST_PATH_NAMES),
+        ]
     ),
 }
 
@@ -35,13 +54,41 @@ def cache_client(
 ) -> Iterator[tuple[TestClient, FakeRedis]]:
     redis = FakeRedis()
     app = create_app(settings, redis_client=redis)  # type: ignore[arg-type]
+
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    app.add_api_route(CACHE_HEALTH_PATH, health, methods=["GET"])
     if configure is not None:
         configure(app)
     with TestClient(app) as client:
         yield client, redis
 
 
+def test_cache_routes_cover_student_and_instructor_apis() -> None:
+    assert CACHE_ROUTES == (
+        "/student/api/v1",
+        "/instructor/api/v1",
+    )
+
+
 def test_public_get_is_cached_for_420_seconds() -> None:
+    settings = build_settings(**TEST_CACHE_SETTINGS)
+
+    with cache_client(settings) as (client, redis):
+        first = client.get(CACHE_HEALTH_PATH)
+        second = client.get(CACHE_HEALTH_PATH)
+
+    assert first.status_code == 200
+    assert first.headers["x-cache"] == "MISS"
+    assert second.status_code == 200
+    assert second.headers["x-cache"] == "HIT"
+    assert second.json() == {"status": "ok"}
+    assert f"cache:{CACHE_HEALTH_PATH}" in redis.values
+    assert redis.ttls[f"cache:{CACHE_HEALTH_PATH}"] == 420
+
+
+def test_path_outside_cache_routes_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
 
     with cache_client(settings) as (client, redis):
@@ -49,35 +96,78 @@ def test_public_get_is_cached_for_420_seconds() -> None:
         second = client.get("/health")
 
     assert first.status_code == 200
-    assert first.headers["x-cache"] == "MISS"
     assert second.status_code == 200
+    assert "x-cache" not in first.headers
+    assert "x-cache" not in second.headers
+    assert "cache:/health" not in redis.values
+
+
+def test_cache_route_requires_a_path_segment_boundary() -> None:
+    path = "/student/api/v10/value"
+    settings = build_settings(
+        cache_exclude_paths="",
+        auth_exclude_paths=path,
+    )
+
+    def configure(app: FastAPI) -> None:
+        async def value() -> dict[str, bool]:
+            return {"ok": True}
+
+        app.add_api_route(path, value, methods=["GET"])
+
+    with cache_client(settings, configure) as (client, redis):
+        response = client.get(path)
+
+    assert response.status_code == 200
+    assert "x-cache" not in response.headers
+    assert f"cache:{path}" not in redis.values
+
+
+def test_instructor_route_is_cached() -> None:
+    path = "/instructor/api/v1/value"
+    settings = build_settings(
+        cache_exclude_paths="",
+        auth_exclude_paths=path,
+    )
+
+    def configure(app: FastAPI) -> None:
+        async def value() -> dict[str, bool]:
+            return {"ok": True}
+
+        app.add_api_route(path, value, methods=["GET"])
+
+    with cache_client(settings, configure) as (client, redis):
+        first = client.get(path)
+        second = client.get(path)
+
+    assert first.headers["x-cache"] == "MISS"
     assert second.headers["x-cache"] == "HIT"
-    assert second.json() == {"status": "ok"}
-    assert "cache:/health" in redis.values
-    assert redis.ttls["cache:/health"] == 420
+    assert f"cache:{path}" in redis.values
 
 
 def test_non_json_response_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/text"
 
     def configure(app: FastAPI) -> None:
         async def text() -> PlainTextResponse:
             return PlainTextResponse('{"ok": true}')
 
-        app.add_api_route("/text", text, methods=["GET"])
+        app.add_api_route(path, text, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        first = client.get("/text")
-        second = client.get("/text")
+        first = client.get(path)
+        second = client.get(path)
 
     assert first.status_code == 200
     assert first.headers["x-cache"] == "MISS"
     assert second.headers["x-cache"] == "MISS"
-    assert "cache:/text" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_json_with_suffix_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/problem"
 
     def configure(app: FastAPI) -> None:
         async def problem() -> Response:
@@ -86,19 +176,20 @@ def test_json_with_suffix_is_not_cached() -> None:
                 media_type="application/problem+json",
             )
 
-        app.add_api_route("/problem", problem, methods=["GET"])
+        app.add_api_route(path, problem, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        first = client.get("/problem")
-        second = client.get("/problem")
+        first = client.get(path)
+        second = client.get(path)
 
     assert first.status_code == 200
     assert second.headers["x-cache"] == "MISS"
-    assert "cache:/problem" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_json_with_charset_is_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/json-charset"
 
     def configure(app: FastAPI) -> None:
         async def charset() -> Response:
@@ -107,26 +198,26 @@ def test_json_with_charset_is_cached() -> None:
                 headers={"content-type": "application/json; charset=utf-8"},
             )
 
-        app.add_api_route("/json-charset", charset, methods=["GET"])
+        app.add_api_route(path, charset, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        first = client.get("/json-charset")
-        second = client.get("/json-charset")
+        first = client.get(path)
+        second = client.get(path)
 
     assert first.status_code == 200
     assert first.headers["x-cache"] == "MISS"
     assert second.headers["x-cache"] == "HIT"
     assert second.json() == {"ok": True}
-    assert "cache:/json-charset" in redis.values
+    assert f"cache:{path}" in redis.values
 
 
 def test_cache_key_includes_query_string() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
 
     with cache_client(settings) as (client, _):
-        first = client.get("/health?limit=10")
-        second = client.get("/health?limit=20")
-        repeat = client.get("/health?limit=10")
+        first = client.get(f"{CACHE_HEALTH_PATH}?limit=10")
+        second = client.get(f"{CACHE_HEALTH_PATH}?limit=20")
+        repeat = client.get(f"{CACHE_HEALTH_PATH}?limit=10")
 
     assert first.headers["x-cache"] == "MISS"
     assert second.headers["x-cache"] == "MISS"
@@ -135,27 +226,41 @@ def test_cache_key_includes_query_string() -> None:
 
 def test_post_requests_are_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/post"
 
-    with cache_client(settings) as (client, redis):
-        response = client.post("/auth/api/v1/token-refresh")
+    def configure(app: FastAPI) -> None:
+        async def post() -> dict[str, bool]:
+            return {"ok": True}
 
-    assert response.status_code == 401
+        app.add_api_route(path, post, methods=["POST"])
+
+    with cache_client(settings, configure) as (client, redis):
+        response = client.post(path)
+
+    assert response.status_code == 200
     assert "x-cache" not in response.headers
     assert not any(key.startswith("cache:") for key in redis.values)
 
 
 def test_rejected_protected_get_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/protected"
 
-    with cache_client(settings) as (client, redis):
+    def configure(app: FastAPI) -> None:
+        async def protected() -> dict[str, bool]:
+            return {"ok": True}
+
+        app.add_api_route(path, protected, methods=["GET"])
+
+    with cache_client(settings, configure) as (client, redis):
         response = client.get(
-            "/openapi.json",
+            path,
             headers=auth_headers(access_token()),
         )
 
     assert response.status_code == 401
     assert "x-cache" not in response.headers
-    assert "cache:/openapi.json" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_request_with_authorization_header_bypasses_cache() -> None:
@@ -163,65 +268,76 @@ def test_request_with_authorization_header_bypasses_cache() -> None:
 
     with cache_client(settings) as (client, redis):
         response = client.get(
-            "/health",
+            CACHE_HEALTH_PATH,
             headers={"Authorization": "Bearer irrelevant"},
         )
 
     assert response.status_code == 200
     assert "x-cache" not in response.headers
-    assert "cache:/health" not in redis.values
+    assert f"cache:{CACHE_HEALTH_PATH}" not in redis.values
 
 
 def test_request_with_cookie_bypasses_cache() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
 
     with cache_client(settings) as (client, redis):
-        response = client.get("/health", headers={"Cookie": "session=abc"})
+        response = client.get(
+            CACHE_HEALTH_PATH,
+            headers={"Cookie": "session=abc"},
+        )
 
     assert response.status_code == 200
     assert "x-cache" not in response.headers
-    assert "cache:/health" not in redis.values
+    assert f"cache:{CACHE_HEALTH_PATH}" not in redis.values
 
 
 def test_authenticated_session_bypasses_cache() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/protected"
 
-    with cache_client(settings) as (client, redis):
+    def configure(app: FastAPI) -> None:
+        async def protected() -> dict[str, bool]:
+            return {"ok": True}
+
+        app.add_api_route(path, protected, methods=["GET"])
+
+    with cache_client(settings, configure) as (client, redis):
         seed_session(redis)
         response = client.get(
-            "/openapi.json",
+            path,
             headers=auth_headers(access_token()),
         )
 
     assert response.status_code == 200
     assert "x-cache" not in response.headers
-    assert "cache:/openapi.json" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_non_200_response_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/error"
 
     def configure(app: FastAPI) -> None:
         async def error() -> JSONResponse:
             return JSONResponse({"detail": "Not found"}, status_code=404)
 
-        app.add_api_route("/error", error, methods=["GET"])
+        app.add_api_route(path, error, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        response = client.get("/error")
+        response = client.get(path)
 
     assert response.status_code == 404
     assert response.headers["x-cache"] == "MISS"
-    assert "cache:/error" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 @pytest.mark.parametrize(
     ("path", "headers"),
     [
-        ("/no-store", {"Cache-Control": "no-store"}),
-        ("/private", {"Cache-Control": "private, max-age=60"}),
-        ("/vary", {"Vary": "*"}),
-        ("/cookie", {"Set-Cookie": "session=abc; Path=/"}),
+        (f"{CACHE_PREFIX}/no-store", {"Cache-Control": "no-store"}),
+        (f"{CACHE_PREFIX}/private", {"Cache-Control": "private, max-age=60"}),
+        (f"{CACHE_PREFIX}/vary", {"Vary": "*"}),
+        (f"{CACHE_PREFIX}/cookie", {"Set-Cookie": "session=abc; Path=/"}),
     ],
 )
 def test_uncacheable_responses_are_not_stored(
@@ -249,21 +365,22 @@ def test_uncacheable_responses_are_not_stored(
 
 def test_large_response_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/large"
 
     def configure(app: FastAPI) -> None:
         async def large() -> PlainTextResponse:
             return PlainTextResponse("x" * (MAX_CACHE_BODY_BYTES + 1))
 
-        app.add_api_route("/large", large, methods=["GET"])
+        app.add_api_route(path, large, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        first = client.get("/large")
-        second = client.get("/large")
+        first = client.get(path)
+        second = client.get(path)
 
     assert first.status_code == 200
     assert len(first.content) == MAX_CACHE_BODY_BYTES + 1
     assert second.headers["x-cache"] == "MISS"
-    assert "cache:/large" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_cache_hit_does_not_reuse_cors_headers() -> None:
@@ -274,11 +391,11 @@ def test_cache_hit_does_not_reuse_cors_headers() -> None:
 
     with cache_client(settings) as (client, _):
         allowed = client.get(
-            "/health",
+            CACHE_HEALTH_PATH,
             headers={"Origin": "https://allowed.example"},
         )
         disallowed = client.get(
-            "/health",
+            CACHE_HEALTH_PATH,
             headers={"Origin": "https://evil.example"},
         )
 
@@ -293,8 +410,14 @@ def test_cache_hit_uses_the_current_request_id() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
 
     with cache_client(settings) as (client, _):
-        first = client.get("/health", headers={"x-request-id": "first-request"})
-        second = client.get("/health", headers={"x-request-id": "second-request"})
+        first = client.get(
+            CACHE_HEALTH_PATH,
+            headers={"x-request-id": "first-request"},
+        )
+        second = client.get(
+            CACHE_HEALTH_PATH,
+            headers={"x-request-id": "second-request"},
+        )
 
     assert first.headers["x-request-id"] == "first-request"
     assert second.headers["x-cache"] == "HIT"
@@ -303,6 +426,7 @@ def test_cache_hit_uses_the_current_request_id() -> None:
 
 def test_streaming_response_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/stream"
 
     def configure(app: FastAPI) -> None:
         async def stream_body():
@@ -312,20 +436,21 @@ def test_streaming_response_is_not_cached() -> None:
         async def stream() -> StreamingResponse:
             return StreamingResponse(stream_body(), media_type="text/plain")
 
-        app.add_api_route("/stream", stream, methods=["GET"])
+        app.add_api_route(path, stream, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        first = client.get("/stream")
-        second = client.get("/stream")
+        first = client.get(path)
+        second = client.get(path)
 
     assert first.status_code == 200
     assert first.content == b"onetwo"
     assert second.headers["x-cache"] == "MISS"
-    assert "cache:/stream" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_multi_chunk_json_stream_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/json-stream"
 
     def configure(app: FastAPI) -> None:
         async def stream_body():
@@ -338,11 +463,11 @@ def test_multi_chunk_json_stream_is_not_cached() -> None:
                 media_type="application/json",
             )
 
-        app.add_api_route("/json-stream", stream, methods=["GET"])
+        app.add_api_route(path, stream, methods=["GET"])
 
     with cache_client(settings, configure) as (client, redis):
-        first = client.get("/json-stream")
-        second = client.get("/json-stream")
+        first = client.get(path)
+        second = client.get(path)
 
     assert first.status_code == 200
     assert first.content == b'{"ok":true}'
@@ -350,7 +475,7 @@ def test_multi_chunk_json_stream_is_not_cached() -> None:
     assert second.status_code == 200
     assert second.content == b'{"ok":true}'
     assert second.headers["x-cache"] == "MISS"
-    assert "cache:/json-stream" not in redis.values
+    assert f"cache:{path}" not in redis.values
 
 
 def test_redis_read_failure_fails_open() -> None:
@@ -358,7 +483,7 @@ def test_redis_read_failure_fails_open() -> None:
 
     with cache_client(settings) as (client, redis):
         redis.fail("get")
-        response = client.get("/health")
+        response = client.get(CACHE_HEALTH_PATH)
 
     assert response.status_code == 200
     assert response.headers["x-cache"] == "MISS"
@@ -369,7 +494,7 @@ def test_redis_write_failure_fails_open() -> None:
 
     with cache_client(settings) as (client, redis):
         redis.fail("set")
-        response = client.get("/health")
+        response = client.get(CACHE_HEALTH_PATH)
 
     assert response.status_code == 200
-    assert "cache:/health" not in redis.values
+    assert f"cache:{CACHE_HEALTH_PATH}" not in redis.values

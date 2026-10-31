@@ -20,6 +20,10 @@ logger = logging.getLogger("backend.cache")
 
 CACHE_KEY_PREFIX = "cache:"
 MAX_CACHE_BODY_BYTES = 1024 * 1024
+CACHE_ROUTES = (
+    "/student/api/v1",
+    "/instructor/api/v1",
+)
 EXCLUDED_RESPONSE_HEADERS = frozenset(
     {
         b"access-control-allow-credentials",
@@ -53,6 +57,16 @@ def _is_json_content_type(value: str | None) -> bool:
     return media_type == "application/json"
 
 
+def _matches_cache_route(path: str) -> bool:
+    """Return whether ``path`` is under one of the cache route prefixes."""
+
+    for route in CACHE_ROUTES:
+        prefix = route.rstrip("/") or "/"
+        if path == prefix or path.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
 class CacheMiddleware(BaseHTTPMiddleware):
     """Cache only unauthenticated, cookie-free GET responses."""
 
@@ -80,6 +94,8 @@ class CacheMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path.rstrip("/") or "/"
+        if not _matches_cache_route(path):
+            return await call_next(request)
         if path in self.exclude_paths:
             return await call_next(request)
 

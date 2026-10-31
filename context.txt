@@ -18,8 +18,14 @@ Caching
 - Cache only responses whose media type is exactly application/json.
 - Media-type parameters are allowed, e.g. application/json; charset=utf-8.
 - Do not cache application/problem+json or any other non-JSON media type.
-- Non-JSON GET responses stream through without buffering and still get
-  X-Cache: MISS.
+- Only paths under CACHE_ROUTES are cache candidates. The tuple lives in
+  backend/app/middleware/cache.py and contains /student/api/v1 and
+  /instructor/api/v1. Matching is segment-aware, so /student/api/v10 does not
+  match /student/api/v1.
+- Paths outside CACHE_ROUTES bypass cache reads and writes and do not get an
+  X-Cache header.
+- Non-JSON GET responses under a cache route stream through without buffering
+  and still get X-Cache: MISS.
 - Public, cookie-free, non-authenticated 200 GET responses only.
 - Cache key: cache:<path> plus ?<raw query string> when present.
 - TTL: CACHE_TTL_SECONDS (420 seconds by default).
@@ -61,7 +67,8 @@ Prior decisions that remain in place
 - Refresh is BaseHTTPMiddleware handling POST /auth/api/v1/token-refresh.
 - Auth, Cache, RateLimit, RefreshToken, and RequestLogger are all Starlette
   BaseHTTPMiddleware; CORS remains the built-in CORSMiddleware.
-- Cache only public GETs (no Authorization, no Cookie, no authenticated session).
+- Cache only public GETs under CACHE_ROUTES (no Authorization, no Cookie, no
+  authenticated session).
 - Anonymous rate limiting keys on the socket IP.
 - Middleware order is
   CORS -> RequestLogger -> Auth -> RateLimit -> RefreshToken -> Cache -> routes.
@@ -90,6 +97,11 @@ Completed
 - Preserved cache behavior for JSON-only storage, X-Cache, the 1 MiB limit,
   Redis fail-open, and streaming pass-through; added a multi-chunk JSON
   streaming regression test.
+- Added CACHE_ROUTES = ("/student/api/v1", "/instructor/api/v1") as the cache
+  allowlist with segment-aware prefix matching. Non-matching paths bypass Redis
+  and receive no X-Cache header.
+- Moved cache tests under the /student/api/v1 prefix and added coverage for
+  /instructor/api/v1, unmatched paths, and the /student/api/v10 boundary.
 - Added exact application/json filtering to cache storage, cache reads, and
   response buffering.
 - Rewrote/expanded backend/tests/test_rate_limit.py and test_cache.py.
@@ -117,7 +129,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 109 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 113 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -145,7 +157,8 @@ Relevant Files
 - backend/app/middleware/cors.py
   Starlette CORSMiddleware configuration.
 - backend/app/middleware/cache.py
-  BaseHTTPMiddleware JSON-only Redis response cache and X-Cache handling.
+  BaseHTTPMiddleware JSON-only Redis response cache, CACHE_ROUTES allowlist,
+  and X-Cache handling.
 - backend/app/middleware/refresh_token.py
   BaseHTTPMiddleware POST /auth/api/v1/token-refresh rotation handler.
 - backend/app/middleware/ratelimit/__init__.py
@@ -191,6 +204,9 @@ Important Context
   and the session TTL is extended to 604800 seconds. New access and refresh
   tokens reuse the same session ID. Cookie attributes: HttpOnly, Secure,
   SameSite=Strict, Path=/auth/api/v1/token-refresh, Max-Age=604800.
+- Cache routes: CACHE_ROUTES = ("/student/api/v1", "/instructor/api/v1") in
+  cache.py. Matching is segment-aware; non-matching paths skip Redis and have
+  no X-Cache header. Cache key is cache:<path>[?<query>].
 - RequestLogger measures duration until the response object is produced, so
   streamed body transfer time is not included.
 - Rate-limit keys: ratelimit:<strategy>:<prefix>:<identifier>.
