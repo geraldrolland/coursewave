@@ -35,8 +35,9 @@ Rate limiting
     {"prefix": "*", "window_ms": 90000, "strategy": "fixed_window"}
 - Unmatched paths use the fallback
   {"prefix": "*", "window_ms": 90000, "strategy": "fixed_window"}.
-- Match request paths against configured prefixes; the longest matching
-  non-wildcard prefix wins; wildcard is checked last.
+- Match request paths against configured prefixes in list order; the first
+  matching prefix wins. `*` matches any path, and unmatched paths use the
+  built-in `{"window_ms": 90000, "strategy": "fixed_window"}` fallback.
 - Resolve strategy through backend/app/middleware/ratelimit/ratelimiter_registry.py.
 - RATELIMITER_REGISTRY maps both fixed_window and token_bucket to async handlers.
 - Handlers take the request and window_ms and return bool.
@@ -77,6 +78,9 @@ Completed
   with bool returns and RateLimitResult state metadata.
 - Rewrote rate-limit middleware for longest-prefix matching, wildcard fallback,
   registry lookup, state metadata, headers, 429 responses, and Redis fail-open.
+- Converted RateLimitMiddleware to Starlette BaseHTTPMiddleware with first-match
+  prefix routing and removed parse_ratelimit_routes and its normalization
+  helpers.
 - Added exact application/json filtering to cache storage, cache reads, and
   response buffering.
 - Rewrote/expanded backend/tests/test_rate_limit.py and test_cache.py.
@@ -90,13 +94,10 @@ Active
 - None.
 
 Blocked
-- Docker CLI is unavailable, so docker compose config --quiet cannot run.
-  Compose has been validated structurally with PyYAML instead.
-- No containers or Docker Desktop were started.
+- None.
 
 Next Move
-- Commit and push the consolidated backend to origin/main.
-- No further implementation is pending.
+- None. The BaseHTTPMiddleware rate-limit refactor is implemented and validated.
 
 Known Gaps
 - No login/token-issuer endpoint exists; auth validates existing access tokens
@@ -106,16 +107,15 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 109 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 108 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
 - RATELIMIT_ROUTES JSON environment parsing verified.
-- Compose YAML parses structurally with services coursewave, postgres, redis,
-  rabbitmq; ports are 3000:8000; old RATE_LIMIT_ROUTES and
-  RATE_LIMIT_WINDOW_MS are absent.
-- Known gap: docker compose config --quiet could not run because Docker is
-  unavailable; no containers were started.
+- docker compose config --quiet: passed.
+- Compose services: coursewave, postgres, redis, rabbitmq; ports 3000:8000;
+  old RATE_LIMIT_ROUTES and RATE_LIMIT_WINDOW_MS are absent.
+- No containers or Docker Desktop were started.
 
 
 Relevant Files
@@ -137,7 +137,8 @@ Relevant Files
 - backend/app/middleware/refresh_token.py
   POST /auth/api/v1/token-refresh rotation middleware.
 - backend/app/middleware/ratelimit/__init__.py
-  Route parsing, prefix/wildcard matching, registry dispatch, headers, 429s.
+  BaseHTTPMiddleware dispatch, prefix/wildcard matching, registry dispatch,
+  headers, and 429 responses.
 - backend/app/middleware/ratelimit/ratelimiter_registry.py
   dict[str, RateLimiterHandler] mapping fixed_window and token_bucket.
 - backend/app/middleware/ratelimit/fixed_window.py

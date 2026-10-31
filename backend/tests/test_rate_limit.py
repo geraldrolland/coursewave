@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 
 from app.base_config import Settings
 from app.main import create_app
-from app.middleware.ratelimit import parse_ratelimit_routes
 from app.middleware.ratelimit.ratelimiter_registry import RATELIMITER_REGISTRY
 from tests.fakes import FakeRedis
 from tests.helpers import access_token, auth_headers, build_settings, seed_session
@@ -36,46 +35,6 @@ def rate_client(
 def test_registry_maps_strategy_names_to_handlers() -> None:
     assert set(RATELIMITER_REGISTRY) == {"fixed_window", "token_bucket"}
     assert all(callable(handler) for handler in RATELIMITER_REGISTRY.values())
-
-
-def test_parse_ratelimit_routes_normalizes_and_ignores_malformed_entries() -> None:
-    routes = parse_ratelimit_routes(
-        [
-            {
-                "prefix": "/student/api/",
-                "window_ms": 90000,
-                "strategy": "fixedWindow",
-            },
-            {
-                "prefix": "student/other",
-                "window_ms": "5000",
-                "strategy": "tokenBucket",
-            },
-            "not-a-dict",
-            {"prefix": "", "window_ms": 1000, "strategy": "fixed_window"},
-            {"prefix": "/broken", "window_ms": "not-a-number"},
-        ]
-    )
-
-    by_prefix = {route.prefix: route for route in routes}
-    assert by_prefix["/student/api"].strategy == "fixed_window"
-    assert by_prefix["/student/api"].window_ms == 90000
-    assert by_prefix["/student/other"].strategy == "token_bucket"
-    assert by_prefix["/student/other"].window_ms == 5000
-    assert len(routes) == 2
-
-
-def test_parse_ratelimit_routes_handles_non_lists_and_unknown_strategies() -> None:
-    assert parse_ratelimit_routes(None) == []
-    assert parse_ratelimit_routes("not-a-list") == []
-
-    routes = parse_ratelimit_routes(
-        [{"prefix": "/health", "strategy": "sliding_window"}]
-    )
-
-    assert len(routes) == 1
-    assert routes[0].strategy == "fixed_window"
-    assert routes[0].window_ms == 90000
 
 
 def test_fixed_window_limits_requests_and_sets_headers() -> None:
@@ -170,7 +129,7 @@ def test_token_bucket_allows_burst_then_rejects() -> None:
     )
 
 
-def test_longest_prefix_route_wins() -> None:
+def test_first_matching_prefix_route_wins() -> None:
     settings = build_settings(
         rate_limit_max=10,
         rate_limit_exclude_paths="",
@@ -178,13 +137,13 @@ def test_longest_prefix_route_wins() -> None:
         auth_exclude_paths="/health,/health/deep",
         ratelimit_routes=[
             {
-                "prefix": "/health",
-                "window_ms": 90000,
+                "prefix": "/health/deep",
+                "window_ms": 60000,
                 "strategy": "fixed_window",
             },
             {
-                "prefix": "/health/deep",
-                "window_ms": 60000,
+                "prefix": "/health",
+                "window_ms": 90000,
                 "strategy": "fixed_window",
             },
         ],
@@ -260,6 +219,33 @@ def test_builtin_fallback_is_used_without_a_wildcard_route() -> None:
 
     assert first.status_code == 200
     assert first.headers["x-ratelimit-reset"] == "90"
+    assert second.status_code == 429
+    assert any(
+        key.startswith("ratelimit:fixed_window:*:")
+        for key in redis.values
+    )
+
+
+def test_unknown_strategy_falls_back_to_fixed_window() -> None:
+    settings = build_settings(
+        rate_limit_max=1,
+        rate_limit_exclude_paths="",
+        cache_enabled=False,
+        ratelimit_routes=[
+            {
+                "prefix": "*",
+                "window_ms": 30000,
+                "strategy": "sliding_window",
+            }
+        ],
+    )
+
+    with rate_client(settings) as (client, redis):
+        first = client.get("/health")
+        second = client.get("/health")
+
+    assert first.status_code == 200
+    assert first.headers["x-ratelimit-reset"] == "30"
     assert second.status_code == 429
     assert any(
         key.startswith("ratelimit:fixed_window:*:")

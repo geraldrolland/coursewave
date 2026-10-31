@@ -238,11 +238,12 @@ Routes are configured with `RATELIMIT_ROUTES`, a JSON list of dictionaries:
 ]
 ```
 
-- `prefix`: request path prefix. The longest matching non-wildcard prefix wins.
+- `prefix`: request path prefix. Routes are checked in configured order and the
+  first matching prefix wins.
 - `window_ms`: window length in milliseconds.
 - `strategy`: registry key used to select the rate-limit handler.
-- `{"prefix": "*"}` is the fallback for paths that do not match another route.
-- If no wildcard route is configured, the middleware falls back to
+- `{"prefix": "*"}` matches any path and is normally listed last.
+- If no route matches, the middleware falls back to
   `{"window_ms": 90000, "strategy": "fixed_window"}`.
 - `RATE_LIMIT_MAX` is the number of requests allowed per window for both
   strategies.
