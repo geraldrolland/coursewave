@@ -135,6 +135,9 @@ first:
 CORS -> RequestLogger -> Auth -> RateLimit -> RefreshToken -> Cache -> routes
 ```
 
+All custom middleware uses Starlette's `BaseHTTPMiddleware`; CORS uses the
+built-in `CORSMiddleware`.
+
 - CORS handles browser preflight requests before authentication.
 - Request logging covers rejected requests too.
 - Auth validates access tokens and loads the session.
@@ -178,8 +181,8 @@ configured with `AUTH_EXCLUDE_PATHS`.
 
 ## Token Refresh
 
-`POST /auth/api/v1/token-refresh` is handled by ASGI middleware, not a route.
-It reads the `refresh` cookie, which uses Express-compatible signing:
+`POST /auth/api/v1/token-refresh` is handled by `BaseHTTPMiddleware`, not a
+route. It reads the `refresh` cookie, which uses Express-compatible signing:
 
 ```text
 s:<JWT>.<base64(HMAC-SHA256(COOKIE_SECRET, JWT)) without padding>

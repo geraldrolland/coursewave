@@ -1,15 +1,18 @@
-"""ASGI middleware that caches public GET responses in Redis."""
+"""BaseHTTPMiddleware that caches public GET responses in Redis."""
 
 import base64
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from starlette.datastructures import Headers, MutableHeaders
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.datastructures import Headers
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import Response, StreamingResponse
+from starlette.types import ASGIApp, Scope
 
 from app.base_config import Settings, split_csv
 
@@ -50,7 +53,7 @@ def _is_json_content_type(value: str | None) -> bool:
     return media_type == "application/json"
 
 
-class CacheMiddleware:
+class CacheMiddleware(BaseHTTPMiddleware):
     """Cache only unauthenticated, cookie-free GET responses."""
 
     def __init__(
@@ -59,7 +62,7 @@ class CacheMiddleware:
         settings: Settings,
         redis_provider: Callable[[], Redis],
     ) -> None:
-        self.app = app
+        super().__init__(app)
         self.redis_provider = redis_provider
         self.enabled = settings.cache_enabled
         self.ttl_seconds = settings.cache_ttl_seconds
@@ -68,42 +71,39 @@ class CacheMiddleware:
             for path in split_csv(settings.cache_exclude_paths)
         }
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not self.enabled:
-            await self.app(scope, receive, send)
-            return
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if not self.enabled or request.method != "GET":
+            return await call_next(request)
 
-        if scope.get("method") != "GET":
-            await self.app(scope, receive, send)
-            return
-
-        path = (scope.get("path") or "").rstrip("/") or "/"
+        path = request.url.path.rstrip("/") or "/"
         if path in self.exclude_paths:
-            await self.app(scope, receive, send)
-            return
+            return await call_next(request)
 
-        headers = Headers(scope=scope)
-        if headers.get("authorization") is not None:
-            await self.app(scope, receive, send)
-            return
-        if headers.get("cookie") is not None:
-            await self.app(scope, receive, send)
-            return
+        if request.headers.get("authorization") is not None:
+            return await call_next(request)
+        if request.headers.get("cookie") is not None:
+            return await call_next(request)
+        if getattr(request.state, "user", None):
+            return await call_next(request)
 
-        state = scope.get("state")
-        if isinstance(state, dict) and state.get("user"):
-            await self.app(scope, receive, send)
-            return
-
-        cache_key = self._cache_key(scope)
+        cache_key = self._cache_key(request.scope)
         redis = self.redis_provider()
 
         cached_response = await self._read_cache(redis, cache_key)
         if cached_response is not None:
-            await self._send_cached(send, *cached_response)
-            return
+            return self._cached_response(*cached_response)
 
-        await self._forward_and_store(scope, receive, send, redis, cache_key)
+        response = await call_next(request)
+        response.headers["X-Cache"] = "MISS"
+
+        if not self._is_cacheable_response(response):
+            return response
+
+        return await self._forward_and_store(response, redis, cache_key)
 
     @staticmethod
     def _cache_key(scope: Scope) -> str:
@@ -116,6 +116,24 @@ class CacheMiddleware:
         query = scope.get("query_string", b"").decode("latin-1")
         key = f"{CACHE_KEY_PREFIX}{path}"
         return f"{key}?{query}" if query else key
+
+    @staticmethod
+    def _is_cacheable_response(response: Response) -> bool:
+        if response.status_code != 200:
+            return False
+
+        headers = response.headers
+        if not _is_json_content_type(headers.get("content-type")):
+            return False
+        if headers.get("set-cookie") is not None:
+            return False
+
+        vary = headers.get("vary", "")
+        if any(value.strip() == "*" for value in vary.split(",")):
+            return False
+
+        cache_control = headers.get("cache-control", "").lower()
+        return "no-store" not in cache_control and "private" not in cache_control
 
     async def _read_cache(
         self,
@@ -160,132 +178,96 @@ class CacheMiddleware:
         return status, headers, body
 
     @staticmethod
-    async def _send_cached(
-        send: Send,
+    def _cached_response(
         status: int,
         headers: list[tuple[bytes, bytes]],
         body: bytes,
-    ) -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status,
-                "headers": headers,
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
+    ) -> Response:
+        response = Response(content=body, status_code=status)
+        response.raw_headers = headers
+        return response
 
     async def _forward_and_store(
         self,
-        scope: Scope,
-        receive: Receive,
-        send: Send,
+        response: Response,
         redis: Redis,
         cache_key: str,
-    ) -> None:
-        start_message: Message | None = None
-        body_chunks: list[bytes] = []
-        body_size = 0
-        buffering = True
+    ) -> Response:
+        body_iterator = response.body_iterator
+        first_chunk = await self._next_chunk(body_iterator)
 
-        async def send_wrapper(message: Message) -> None:
-            nonlocal start_message, body_size, buffering
+        if first_chunk is None:
+            await self._store_response(redis, cache_key, response, b"")
+            return self._buffered_response(response, b"")
 
-            if message["type"] == "http.response.start":
-                start_message = message
-                buffering = _is_json_content_type(
-                    Headers(raw=message.get("headers", [])).get("content-type")
-                )
-                response_headers = MutableHeaders(scope=message)
-                response_headers["X-Cache"] = "MISS"
-                await send(message)
-                return
-
-            if message["type"] != "http.response.body":
-                await send(message)
-                return
-
-            chunk = message.get("body", b"")
-            more_body = bool(message.get("more_body", False))
-
-            if not buffering:
-                await send(message)
-                return
-
-            body_chunks.append(chunk)
-            body_size += len(chunk)
-
-            if more_body:
-                # Multi-chunk responses are treated as streaming and are not
-                # buffered for caching.
-                buffering = False
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": b"".join(body_chunks),
-                        "more_body": True,
-                    }
-                )
-                body_chunks.clear()
-                return
-
-            if body_size > MAX_CACHE_BODY_BYTES:
-                buffering = False
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": b"".join(body_chunks),
-                        "more_body": True,
-                    }
-                )
-                body_chunks.clear()
-                await send({"type": "http.response.body", "body": b""})
-                return
-
-            buffering = False
-            body = b"".join(body_chunks)
-            await send({"type": "http.response.body", "body": body})
-            await self._store_response(
-                redis,
-                cache_key,
-                start_message,
-                body,
+        if len(first_chunk) > MAX_CACHE_BODY_BYTES:
+            return self._stream_response(
+                response,
+                [first_chunk],
+                body_iterator,
             )
 
-        await self.app(scope, receive, send_wrapper)
+        second_chunk = await self._next_chunk(body_iterator)
+        if second_chunk is not None:
+            return self._stream_response(
+                response,
+                [first_chunk, second_chunk],
+                body_iterator,
+            )
+
+        await self._store_response(redis, cache_key, response, first_chunk)
+        return self._buffered_response(response, first_chunk)
+
+    @staticmethod
+    async def _next_chunk(body_iterator: AsyncIterator[bytes]) -> bytes | None:
+        try:
+            return await body_iterator.__anext__()
+        except StopAsyncIteration:
+            return None
+
+    @staticmethod
+    def _buffered_response(response: Response, body: bytes) -> Response:
+        buffered = Response(content=body, status_code=response.status_code)
+        buffered.raw_headers = list(response.headers.raw)
+        return buffered
+
+    @staticmethod
+    def _stream_response(
+        response: Response,
+        buffered_chunks: list[bytes],
+        body_iterator: AsyncIterator[bytes],
+    ) -> StreamingResponse:
+        async def stream_body() -> AsyncIterator[bytes]:
+            for chunk in buffered_chunks:
+                yield chunk
+            async for chunk in body_iterator:
+                yield chunk
+
+        streaming = StreamingResponse(
+            stream_body(),
+            status_code=response.status_code,
+        )
+        streaming.raw_headers = list(response.headers.raw)
+        return streaming
 
     async def _store_response(
         self,
         redis: Redis,
         cache_key: str,
-        start_message: Message | None,
+        response: Response,
         body: bytes,
     ) -> None:
-        if start_message is None or start_message.get("status") != 200:
-            return
-
-        headers = Headers(raw=start_message.get("headers", []))
-        if not _is_json_content_type(headers.get("content-type")):
-            return
-        if headers.get("set-cookie") is not None:
-            return
-
-        vary = headers.get("vary", "")
-        if any(value.strip() == "*" for value in vary.split(",")):
-            return
-
-        cache_control = headers.get("cache-control", "").lower()
-        if "no-store" in cache_control or "private" in cache_control:
+        if not self._is_cacheable_response(response):
             return
 
         stored_headers = [
             [name.decode("latin-1"), value.decode("latin-1")]
-            for name, value in start_message.get("headers", [])
+            for name, value in response.headers.raw
             if name.lower() not in EXCLUDED_RESPONSE_HEADERS
         ]
         payload = json.dumps(
             {
-                "status": start_message["status"],
+                "status": response.status_code,
                 "headers": stored_headers,
                 "body": base64.b64encode(body).decode("ascii"),
             }

@@ -23,7 +23,7 @@ TEST_CACHE_SETTINGS = {
     "cache_exclude_paths": "",
     "auth_exclude_paths": (
         "/health,/no-store,/private,/vary,/cookie,/large,/error,/stream,"
-        "/text,/problem,/json-charset"
+        "/text,/problem,/json-charset,/json-stream"
     ),
 }
 
@@ -322,6 +322,35 @@ def test_streaming_response_is_not_cached() -> None:
     assert first.content == b"onetwo"
     assert second.headers["x-cache"] == "MISS"
     assert "cache:/stream" not in redis.values
+
+
+def test_multi_chunk_json_stream_is_not_cached() -> None:
+    settings = build_settings(**TEST_CACHE_SETTINGS)
+
+    def configure(app: FastAPI) -> None:
+        async def stream_body():
+            yield b'{"ok":'
+            yield b"true}"
+
+        async def stream() -> StreamingResponse:
+            return StreamingResponse(
+                stream_body(),
+                media_type="application/json",
+            )
+
+        app.add_api_route("/json-stream", stream, methods=["GET"])
+
+    with cache_client(settings, configure) as (client, redis):
+        first = client.get("/json-stream")
+        second = client.get("/json-stream")
+
+    assert first.status_code == 200
+    assert first.content == b'{"ok":true}'
+    assert first.headers["x-cache"] == "MISS"
+    assert second.status_code == 200
+    assert second.content == b'{"ok":true}'
+    assert second.headers["x-cache"] == "MISS"
+    assert "cache:/json-stream" not in redis.values
 
 
 def test_redis_read_failure_fails_open() -> None:

@@ -58,7 +58,9 @@ Prior decisions that remain in place
 - New error bodies use {"detail": "..."}.
 - Compose service is named coursewave, builds ./backend, publishes 3000:8000.
 - RabbitMQ replaces Kafka; Kafka and api_gateway/ are removed.
-- Refresh is ASGI middleware handling POST /auth/api/v1/token-refresh.
+- Refresh is BaseHTTPMiddleware handling POST /auth/api/v1/token-refresh.
+- Auth, Cache, RateLimit, RefreshToken, and RequestLogger are all Starlette
+  BaseHTTPMiddleware; CORS remains the built-in CORSMiddleware.
 - Cache only public GETs (no Authorization, no Cookie, no authenticated session).
 - Anonymous rate limiting keys on the socket IP.
 - Middleware order is
@@ -76,11 +78,18 @@ Completed
 - Added backend/app/middleware/ratelimit/ratelimiter_registry.py.
 - Converted fixed-window and token-bucket limiters into async handler functions
   with bool returns and RateLimitResult state metadata.
-- Rewrote rate-limit middleware for longest-prefix matching, wildcard fallback,
-  registry lookup, state metadata, headers, 429 responses, and Redis fail-open.
+- Rewrote rate-limit middleware for first-match prefix routing, wildcard
+  fallback, registry lookup, state metadata, headers, 429 responses, and Redis
+  fail-open.
 - Converted RateLimitMiddleware to Starlette BaseHTTPMiddleware with first-match
   prefix routing and removed parse_ratelimit_routes and its normalization
   helpers.
+- Converted AuthMiddleware, CacheMiddleware, RefreshTokenMiddleware, and
+  RequestLoggerMiddleware to BaseHTTPMiddleware dispatch. CORS remains the
+  built-in CORSMiddleware.
+- Preserved cache behavior for JSON-only storage, X-Cache, the 1 MiB limit,
+  Redis fail-open, and streaming pass-through; added a multi-chunk JSON
+  streaming regression test.
 - Added exact application/json filtering to cache storage, cache reads, and
   response buffering.
 - Rewrote/expanded backend/tests/test_rate_limit.py and test_cache.py.
@@ -97,7 +106,8 @@ Blocked
 - None.
 
 Next Move
-- None. The BaseHTTPMiddleware rate-limit refactor is implemented and validated.
+- None. Auth, Cache, RefreshToken, and RequestLogger now use BaseHTTPMiddleware;
+  no further implementation is pending.
 
 Known Gaps
 - No login/token-issuer endpoint exists; auth validates existing access tokens
@@ -107,10 +117,11 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 108 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 109 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
+- Auth, Cache, RefreshToken, and RequestLogger subclass BaseHTTPMiddleware.
 - RATELIMIT_ROUTES JSON environment parsing verified.
 - docker compose config --quiet: passed.
 - Compose services: coursewave, postgres, redis, rabbitmq; ports 3000:8000;
@@ -129,13 +140,14 @@ Relevant Files
   Argon2, JWT creation/verification, duration parsing, Express-compatible
   signed-cookie helpers.
 - backend/app/middleware/auth.py
-  Bearer JWT validation and Redis session loading into scope["state"]["user"].
+  BaseHTTPMiddleware bearer JWT validation and Redis session loading into
+  request.state.user.
 - backend/app/middleware/cors.py
   Starlette CORSMiddleware configuration.
 - backend/app/middleware/cache.py
-  JSON-only Redis response cache and X-Cache handling.
+  BaseHTTPMiddleware JSON-only Redis response cache and X-Cache handling.
 - backend/app/middleware/refresh_token.py
-  POST /auth/api/v1/token-refresh rotation middleware.
+  BaseHTTPMiddleware POST /auth/api/v1/token-refresh rotation handler.
 - backend/app/middleware/ratelimit/__init__.py
   BaseHTTPMiddleware dispatch, prefix/wildcard matching, registry dispatch,
   headers, and 429 responses.
@@ -148,7 +160,7 @@ Relevant Files
 - backend/app/middleware/ratelimit/utils.py
   RateLimitResult, client_identifier, rate_limit_headers.
 - backend/app/middleware/request_logger.py
-  Request logging without proxy-signature logic.
+  BaseHTTPMiddleware request logging without proxy-signature logic.
 - backend/app/services/student/router/student.py
   Public registration route and student endpoints.
 - backend/tests/fakes.py
@@ -172,13 +184,15 @@ Important Context
 -----------------
 - Authentication: HS256 Bearer access JWT signed with JWT_SECRET, type must be
   "access", sessionId must be present, and Redis key session:<sessionId> must
-  hold {userId, role, email}. The parsed session is stored in
-  scope["state"]["user"].
+  hold {userId, role, email}. The parsed session is stored as
+  request.state.user (scope["state"]["user"]).
 - Refresh: signed cookie refresh=s:<JWT>.<HMAC-SHA256 base64 without padding>
   using COOKIE_SECRET. The refresh JWT uses JWT_SECRET, type must be "refresh",
   and the session TTL is extended to 604800 seconds. New access and refresh
   tokens reuse the same session ID. Cookie attributes: HttpOnly, Secure,
   SameSite=Strict, Path=/auth/api/v1/token-refresh, Max-Age=604800.
+- RequestLogger measures duration until the response object is produced, so
+  streamed body transfer time is not included.
 - Rate-limit keys: ratelimit:<strategy>:<prefix>:<identifier>.
 - Identifiers: authenticated session userId, otherwise socket IP.
 - Default RATE_LIMIT_MAX is 100.

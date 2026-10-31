@@ -1,4 +1,4 @@
-"""ASGI middleware that implements the refresh-token endpoint."""
+"""BaseHTTPMiddleware that implements the refresh-token endpoint."""
 
 import logging
 from collections.abc import Callable
@@ -7,9 +7,10 @@ from urllib.parse import quote
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from starlette.datastructures import Headers
-from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp
 
 from app.base_config import Settings
 from app.security import (
@@ -33,7 +34,7 @@ SESSION_NOT_FOUND = "Session expired or not found"
 REFRESH_FAILED = "Token refresh failed"
 
 
-class RefreshTokenMiddleware:
+class RefreshTokenMiddleware(BaseHTTPMiddleware):
     """Handle ``POST /auth/api/v1/token-refresh`` and pass everything else on."""
 
     def __init__(
@@ -42,53 +43,44 @@ class RefreshTokenMiddleware:
         settings: Settings,
         redis_provider: Callable[[], Redis],
     ) -> None:
-        self.app = app
+        super().__init__(app)
         self.settings = settings
         self.redis_provider = redis_provider
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        path = (scope.get("path") or "").rstrip("/") or "/"
-        if scope.get("method") != "POST" or path != REFRESH_PATH:
-            await self.app(scope, receive, send)
-            return
-
-        await self._handle_refresh(scope, receive, send)
-
-    async def _handle_refresh(
+    async def dispatch(
         self,
-        scope: Scope,
-        receive: Receive,
-        send: Send,
-    ) -> None:
-        raw_cookie = Headers(scope=scope).get("cookie")
-        signed_value = self._cookie_value(raw_cookie, REFRESH_COOKIE_NAME)
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        path = request.url.path.rstrip("/") or "/"
+        if request.method != "POST" or path != REFRESH_PATH:
+            return await call_next(request)
+
+        return await self._handle_refresh(request)
+
+    async def _handle_refresh(self, request: Request) -> Response:
+        signed_value = self._cookie_value(
+            request.headers.get("cookie"),
+            REFRESH_COOKIE_NAME,
+        )
         if signed_value is None:
-            await self._reject(scope, receive, send, 401, MISSING_REFRESH_TOKEN)
-            return
+            return self._reject(401, MISSING_REFRESH_TOKEN)
 
         token = unsign_cookie_value(signed_value, self.settings.cookie_secret)
         if token is None:
-            await self._reject(scope, receive, send, 401, MISSING_REFRESH_TOKEN)
-            return
+            return self._reject(401, MISSING_REFRESH_TOKEN)
 
         try:
             payload = decode_token(token, self.settings)
         except Exception:
-            await self._reject(scope, receive, send, 401, INVALID_REFRESH_TOKEN)
-            return
+            return self._reject(401, INVALID_REFRESH_TOKEN)
 
         if payload.get("type") != "refresh":
-            await self._reject(scope, receive, send, 401, INVALID_TOKEN_TYPE)
-            return
+            return self._reject(401, INVALID_TOKEN_TYPE)
 
         session_id = payload.get("sessionId")
         if not isinstance(session_id, str) or not session_id:
-            await self._reject(scope, receive, send, 401, INVALID_REFRESH_PAYLOAD)
-            return
+            return self._reject(401, INVALID_REFRESH_PAYLOAD)
 
         session_key = f"session:{session_id}"
         redis = self.redis_provider()
@@ -97,12 +89,10 @@ class RefreshTokenMiddleware:
             session = await redis.get(session_key)
         except RedisError:
             logger.exception("Redis failed while loading a refresh session")
-            await self._reject(scope, receive, send, 500, REFRESH_FAILED)
-            return
+            return self._reject(500, REFRESH_FAILED)
 
         if session is None:
-            await self._reject(scope, receive, send, 401, SESSION_NOT_FOUND)
-            return
+            return self._reject(401, SESSION_NOT_FOUND)
 
         try:
             await redis.expire(
@@ -113,12 +103,10 @@ class RefreshTokenMiddleware:
             refresh_token = create_refresh_token(session_id, self.settings)
         except RedisError:
             logger.exception("Redis failed while extending a refresh session")
-            await self._reject(scope, receive, send, 500, REFRESH_FAILED)
-            return
+            return self._reject(500, REFRESH_FAILED)
         except Exception:
             logger.exception("Unexpected failure while refreshing a token")
-            await self._reject(scope, receive, send, 500, REFRESH_FAILED)
-            return
+            return self._reject(500, REFRESH_FAILED)
 
         cookie_value = quote(
             sign_cookie_value(refresh_token, self.settings.cookie_secret),
@@ -135,7 +123,7 @@ class RefreshTokenMiddleware:
                 f"Path={REFRESH_PATH}; Max-Age={max_age}"
             ),
         )
-        await response(scope, receive, send)
+        return response
 
     @staticmethod
     def _cookie_value(raw_cookie: str | None, name: str) -> str | None:
@@ -152,15 +140,8 @@ class RefreshTokenMiddleware:
         return morsel.value if morsel is not None else None
 
     @staticmethod
-    async def _reject(
-        scope: Scope,
-        receive: Receive,
-        send: Send,
-        status_code: int,
-        detail: str,
-    ) -> None:
-        response = JSONResponse(
+    def _reject(status_code: int, detail: str) -> JSONResponse:
+        return JSONResponse(
             status_code=status_code,
             content={"detail": detail},
         )
-        await response(scope, receive, send)
