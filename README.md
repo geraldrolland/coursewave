@@ -10,7 +10,7 @@ Redis, and RabbitMQ.
 | `coursewave` | FastAPI backend | `3000` |
 | `postgres` | PostgreSQL 17 with `coursewave_db` | `5432` |
 | `redis` | Sessions, cache, rate limits, verification tokens | `6379` |
-| `rabbitmq` | Outbox message broker | `5672`, `15672` |
+| `rabbitmq` | Provisioned message broker | `5672`, `15672` |
 
 ## Quick Start
 

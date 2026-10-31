@@ -7,6 +7,8 @@ Consolidate the CourseWave backend into a single FastAPI service and finish the
 requested refinements:
 - JSON-only response caching.
 - Configurable prefix-based rate limiting with a strategy-to-handler registry.
+- Student auth methods (EMAIL | GOOGLE) with nullable password hashes.
+- Removal of the transactional outbox model.
 - The backend is the public API; api_gateway/ has been deleted.
 - RabbitMQ replaces Kafka.
 - No Docker containers are started during development/validation.
@@ -61,6 +63,14 @@ Rate limiting
 
 Prior decisions that remain in place
 - Student registration remains public and unchanged.
+- Student.auth_method is an AuthMethod enum with EMAIL = "email" and
+  GOOGLE = "google"; the database enum is named auth_method and stores the
+  lowercase values.
+- Student.password_hash is nullable with a NULL default, but email
+  registration still hashes and stores a password.
+- register_student sets auth_method=AuthMethod.EMAIL explicitly.
+- The Outbox model and all outbox writes are removed. RabbitMQ remains
+  provisioned in Compose but is currently unused.
 - New error bodies use {"detail": "..."}.
 - Compose service is named coursewave, builds ./backend, publishes 3000:8000.
 - RabbitMQ replaces Kafka; Kafka and api_gateway/ are removed.
@@ -102,6 +112,19 @@ Completed
   and receive no X-Cache header.
 - Moved cache tests under the /student/api/v1 prefix and added coverage for
   /instructor/api/v1, unmatched paths, and the /student/api/v10 boundary.
+- Added AuthMethod (EMAIL = "email", GOOGLE = "google") to the Student model
+  and exported it from the student model package.
+- Made Student.password_hash nullable with a NULL default and added a
+  non-nullable auth_method column defaulting to AuthMethod.EMAIL.
+- Set auth_method=AuthMethod.EMAIL explicitly during registration while still
+  hashing and storing the password.
+- Deleted backend/app/services/student/model/outbox.py, removed Outbox imports
+  from main.py and the student model package, and removed outbox creation from
+  the registration transaction.
+- Removed the dead build_verification_link helper and its test; APP_HOST remains
+  configured.
+- Updated registration tests for auth-method defaults, nullable password hashes,
+  and outbox-free registration.
 - Added exact application/json filtering to cache storage, cache reads, and
   response buffering.
 - Rewrote/expanded backend/tests/test_rate_limit.py and test_cache.py.
@@ -124,15 +147,21 @@ Next Move
 Known Gaps
 - No login/token-issuer endpoint exists; auth validates existing access tokens
   and refresh rotates existing sessions only.
-- RabbitMQ is provisioned, but no outbox publisher/consumer is implemented yet.
+- RabbitMQ is provisioned, but no publisher/consumer is implemented and nothing
+  currently writes messages.
+- No migration framework exists. Existing databases need a manual migration to
+  add the student.auth_method column and drop the outbox table; create_all only
+  creates missing tables on a fresh database.
 
 
 Validation Results
 ------------------
-- pytest -q: 113 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 112 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
+- Student model exposes AuthMethod and the nullable password_hash/auth_method
+  columns; registration tests pass.
 - Auth, Cache, RefreshToken, and RequestLogger subclass BaseHTTPMiddleware.
 - RATELIMIT_ROUTES JSON environment parsing verified.
 - docker compose config --quiet: passed.
@@ -174,8 +203,16 @@ Relevant Files
   RateLimitResult, client_identifier, rate_limit_headers.
 - backend/app/middleware/request_logger.py
   BaseHTTPMiddleware request logging without proxy-signature logic.
+- backend/app/services/student/model/student.py
+  Student SQLModel with AuthMethod, nullable password_hash, and the
+  non-nullable auth_method enum column.
+- backend/app/services/student/model/__init__.py
+  Exports AuthMethod and Student.
+- backend/app/services/student/model/outbox.py
+  Deleted.
 - backend/app/services/student/router/student.py
-  Public registration route and student endpoints.
+  Public registration route that sets auth_method=AuthMethod.EMAIL, plus
+  student endpoints.
 - backend/tests/fakes.py
   Async FakeRedis test double, including token-bucket eval and failure injection.
 - backend/tests/helpers.py
@@ -218,6 +255,13 @@ Important Context
   pydantic-settings into a list of dicts.
 - Compose service publishes host port 3000 to container port 8000.
 - Registration remains public at /student/api/v1/register.
+- Student auth: AuthMethod.EMAIL.value == "email" and
+  AuthMethod.GOOGLE.value == "google". The auth_method column is non-nullable
+  and defaults to AuthMethod.EMAIL.
+- password_hash is str | None with a NULL default; registration still stores an
+  Argon2 hash for email accounts, and future Google accounts can leave it null.
+- Registration stores the verification token in Redis with a 120-second TTL but
+  no longer enqueues an outbox event or builds an email verification link.
 - All new error responses use {"detail": "..."}.
 - The repository root C:\Users\USER\coursewave is the git repository; the
   remote is https://github.com/geraldrolland/coursewave.git (main).

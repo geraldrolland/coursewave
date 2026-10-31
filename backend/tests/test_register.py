@@ -11,12 +11,8 @@ from sqlalchemy.exc import IntegrityError
 from app.base_dependencies import get_session
 from app.main import create_app
 from app.security import verify_password
-from app.services.student.model import Outbox, OutboxStatus, Student
-from app.services.student.router.student import (
-    OUTBOX_TOPIC,
-    VERIFICATION_TOKEN_TTL_SECONDS,
-    build_verification_link,
-)
+from app.services.student.model import AuthMethod, Student
+from app.services.student.router.student import VERIFICATION_TOKEN_TTL_SECONDS
 from tests.fakes import FakeRedis
 from tests.helpers import build_settings
 
@@ -81,12 +77,10 @@ class FakeSession:
 def registration_client(
     session: FakeSession,
     redis: FakeRedis,
-    app_host: str = "localhost:3000",
 ) -> Iterator[TestClient]:
     """Create an app with fake database and Redis dependencies."""
 
     settings = build_settings(
-        app_host=app_host,
         auto_create_tables=False,
         cache_enabled=False,
         rate_limit_enabled=False,
@@ -110,7 +104,7 @@ def find_added(session: FakeSession, model_type: type[Any]) -> Any:
     return matches[0]
 
 
-def test_registration_creates_student_outbox_and_verification_token() -> None:
+def test_registration_creates_student_and_verification_token() -> None:
     session = FakeSession()
     redis = FakeRedis()
 
@@ -127,8 +121,8 @@ def test_registration_creates_student_outbox_and_verification_token() -> None:
     )
 
     student = find_added(session, Student)
-    outbox = find_added(session, Outbox)
 
+    assert len(session.added) == 1
     assert response.json()["user_id"] == str(student.user_id)
     assert student.first_name == "Ada"
     assert student.middle_name == "Augusta"
@@ -136,13 +130,10 @@ def test_registration_creates_student_outbox_and_verification_token() -> None:
     assert student.email == "ada@example.com"
     assert student.is_email_verified is False
     assert student.profile_pic_url is None
+    assert student.auth_method is AuthMethod.EMAIL
+    assert student.password_hash is not None
     assert student.password_hash != VALID_PAYLOAD["password"]
     assert verify_password(VALID_PAYLOAD["password"], student.password_hash)
-
-    assert outbox.topic == OUTBOX_TOPIC
-    assert outbox.status is OutboxStatus.pending
-    assert outbox.num_of_retries == 0
-    assert outbox.retry_after is None
 
     assert session.flushed is True
     assert session.committed is True
@@ -152,34 +143,6 @@ def test_registration_creates_student_outbox_and_verification_token() -> None:
     token, stored_user_id = next(iter(redis.values.items()))
     assert stored_user_id == str(student.user_id)
     assert redis.ttls[token] == VERIFICATION_TOKEN_TTL_SECONDS
-    assert outbox.payload == {
-        "recipient_email": "ada@example.com",
-        "verification_link": (
-            f"http://localhost:3000/email-verification?token={token}"
-        ),
-    }
-
-
-def test_registration_uses_https_app_host_when_provided() -> None:
-    session = FakeSession()
-    redis = FakeRedis()
-
-    with registration_client(
-        session,
-        redis,
-        app_host="https://coursewave.example",
-    ) as client:
-        response = client.post(
-            REGISTER_PATH,
-            json=VALID_PAYLOAD,
-        )
-
-    assert response.status_code == 201
-    token = next(iter(redis.values))
-    outbox = find_added(session, Outbox)
-    assert outbox.payload["verification_link"] == (
-        f"https://coursewave.example/email-verification?token={token}"
-    )
 
 
 def test_duplicate_email_returns_409_and_rolls_back() -> None:
@@ -243,7 +206,14 @@ def test_invalid_registration_payload_returns_422_without_writes() -> None:
     assert redis.values == {}
 
 
-def test_build_verification_link_adds_http_scheme_when_missing() -> None:
-    assert build_verification_link("localhost:3000/", "abc") == (
-        "http://localhost:3000/email-verification?token=abc"
+def test_student_model_defaults_password_hash_and_auth_method() -> None:
+    student = Student(
+        first_name="Grace",
+        last_name="Hopper",
+        email="grace@example.com",
     )
+
+    assert student.password_hash is None
+    assert student.auth_method is AuthMethod.EMAIL
+    assert Student.__table__.c.password_hash.nullable is True
+    assert Student.__table__.c.auth_method.nullable is False

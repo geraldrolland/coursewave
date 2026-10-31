@@ -15,7 +15,7 @@ directly.
 - FastAPI-standard error responses: `{"detail": "..."}`.
 - Validated student registration with Argon2 password hashing.
 - Redis-backed email verification tokens with a 120-second TTL.
-- Transactional outbox events for asynchronous email delivery.
+- `EMAIL` and `GOOGLE` authentication methods with nullable password hashes.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -61,7 +61,7 @@ backend/
 
 - Python 3.12+
 - PostgreSQL and Redis when running outside Docker Compose
-- RabbitMQ is part of the Compose stack for outbox delivery
+- RabbitMQ is provisioned in the Compose stack for future asynchronous messaging
 
 ### Installation
 
@@ -96,14 +96,14 @@ Copy-Item .env.example .env
 | `RATE_LIMIT_EXCLUDE_PATHS` | Paths that are never rate limited | `/health` |
 | `RATELIMIT_ROUTES` | JSON list of `{prefix, window_ms, strategy}` routes | see `.env.example` |
 | `LOG_LEVEL` | Application log level | `INFO` |
-| `APP_HOST` | Public host used to build email verification links | `localhost:3000` |
+| `APP_HOST` | Public application host | `localhost:3000` |
 | `REDIS_HOST` | Redis host | `localhost` |
 | `REDIS_PORT` | Redis port | `6379` |
 | `REDIS_PASSWORD` | Redis password; empty disables authentication | empty |
 | `REDIS_DB` | Redis database number | `0` |
 | `AUTO_CREATE_TABLES` | Create missing SQLModel tables at startup | `false` |
 | `DATABASE_URL` | Optional SQLAlchemy database URL override | `postgresql+asyncpg://postgres:user123@localhost:5432/coursewave_db` |
-| `RABBITMQ_URL` | Broker URL used by outbox consumers | `amqp://guest:guest@localhost:5672/` |
+| `RABBITMQ_URL` | Broker URL for future asynchronous messaging | `amqp://guest:guest@localhost:5672/` |
 
 ### Run
 
@@ -334,8 +334,10 @@ The endpoint:
 1. Hashes the password with Argon2.
 2. Generates a URL-safe verification token and stores it in Redis with the
    student UUID as its value and a 120-second TTL.
-3. Builds `http://{APP_HOST}/email-verification?token={token}`.
-4. Inserts the `Student` and an `Outbox` row in the same database transaction.
+3. Inserts the `Student` with `auth_method=EMAIL` and the hashed password.
+
+`password_hash` is nullable at the model level, allowing future
+`auth_method=GOOGLE` accounts to have no local password.
 
 Successful response (`201 Created`):
 
@@ -374,15 +376,15 @@ deleted on a best-effort basis.
 The suite covers authentication, CORS, caching, rate limiting, refresh-token
 rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
-duplicate-email handling, and transactional outbox writes.
+duplicate-email handling, and student auth-method defaults.
 
 ## Known Limitations
 
 - There is no login or token-issuance endpoint in this repository. Access and
   refresh tokens must be issued by another service that creates the matching
   Redis session.
-- RabbitMQ is provisioned in Compose, but this repository does not yet contain
-  an outbox publisher or consumer.
+- RabbitMQ is provisioned in Compose, but this repository does not yet publish
+  or consume messages.
 
 ## License
 

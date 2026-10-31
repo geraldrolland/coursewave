@@ -18,7 +18,7 @@ from app.middleware.ratelimit import RateLimitMiddleware
 from app.middleware.refresh_token import RefreshTokenMiddleware
 from app.middleware.request_logger import RequestLoggerMiddleware
 from app.redis_config import create_redis_client
-from app.services.student.model import Outbox, Student  # noqa: F401
+from app.services.student.model import Student  # noqa: F401
 from app.services.student.router.student import router as student_router
 
 

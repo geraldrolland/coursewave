@@ -9,10 +9,9 @@ from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.base_config import Settings
 from app.base_dependencies import get_session
 from app.security import hash_password
-from app.services.student.model import Outbox, OutboxStatus, Student
+from app.services.student.model import AuthMethod, Student
 from app.services.student.schema import (
     StudentRegisterRequest,
     StudentRegisterResponse,
@@ -22,17 +21,6 @@ router = APIRouter(prefix="/student/api/v1", tags=["students"])
 logger = logging.getLogger("student_service.router")
 
 VERIFICATION_TOKEN_TTL_SECONDS = 120
-OUTBOX_TOPIC = "student.registered"
-
-
-def build_verification_link(app_host: str, token: str) -> str:
-    """Build the email verification link for a registration token."""
-
-    base_url = app_host.rstrip("/")
-    if not base_url.startswith(("http://", "https://")):
-        base_url = f"http://{base_url}"
-
-    return f"{base_url}/email-verification?token={token}"
 
 
 async def _delete_verification_token(redis: Redis, token: str) -> None:
@@ -56,14 +44,12 @@ async def register_student(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> StudentRegisterResponse:
-    """Register a student and enqueue the verification event."""
+    """Register a student and store an email verification token."""
 
-    settings: Settings = request.app.state.settings
     redis: Redis = request.app.state.redis
 
     email = str(payload.email)
     token = secrets.token_urlsafe(32)
-    verification_link = build_verification_link(settings.app_host, token)
     token_stored = False
 
     student = Student(
@@ -73,14 +59,7 @@ async def register_student(
         password_hash=hash_password(payload.password.get_secret_value()),
         email=email,
         is_email_verified=False,
-    )
-    outbox = Outbox(
-        status=OutboxStatus.pending,
-        topic=OUTBOX_TOPIC,
-        payload={
-            "recipient_email": email,
-            "verification_link": verification_link,
-        },
+        auth_method=AuthMethod.EMAIL,
     )
 
     try:
@@ -94,8 +73,6 @@ async def register_student(
                 ex=VERIFICATION_TOKEN_TTL_SECONDS,
             )
             token_stored = True
-
-            session.add(outbox)
     except IntegrityError as exc:
         if token_stored:
             await _delete_verification_token(redis, token)
