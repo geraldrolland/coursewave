@@ -1,5 +1,39 @@
 name: coursewave
 
+x-backend-environment: &backend-environment
+  LOG_LEVEL: "INFO"
+  APP_HOST: "${APP_HOST:-localhost:3000}"
+  DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-user123}@postgres:5432/coursewave_db"
+  AUTO_CREATE_TABLES: "true"
+
+  JWT_SECRET: "${JWT_SECRET:-dev-jwt-secret}"
+  COOKIE_SECRET: "${COOKIE_SECRET:-dev-cookie-secret}"
+  ACCESS_TOKEN_EXPIRY: "7m"
+  REFRESH_TOKEN_EXPIRY: "7d"
+  REFRESH_TOKEN_MAX_AGE_SECONDS: "604800"
+  AUTH_EXCLUDE_PATHS: "/health,/auth/api/v1/token-refresh,/student/api/v1/login,/student/api/v1/register,/student/api/v1/email,/student/api/v1/password-reset,/student/api/v1/verify-email"
+
+  CORS_ORIGIN: "*"
+  CORS_METHODS: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+  CORS_HEADERS: "Content-Type,Authorization,X-Request-ID"
+  CORS_CREDENTIALS: "false"
+
+  CACHE_ENABLED: "true"
+  CACHE_TTL_SECONDS: "420"
+  CACHE_EXCLUDE_PATHS: "/health"
+
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_MAX: "100"
+  RATE_LIMIT_EXCLUDE_PATHS: "/health"
+  RATELIMIT_ROUTES: '[{"prefix":"/student/api","window_ms":90000,"strategy":"fixed_window"},{"prefix":"*","window_ms":90000,"strategy":"fixed_window"}]'
+
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ""
+  REDIS_DB: "0"
+
+  RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER:-coursewave}:${RABBITMQ_DEFAULT_PASSWORD:-coursewave}@rabbitmq:5672/"
+
 services:
   redis:
     image: redis:7-alpine
@@ -59,43 +93,12 @@ services:
       - coursewave
 
   coursewave:
+    image: coursewave-backend
     build:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
-    environment:
-      LOG_LEVEL: "INFO"
-      APP_HOST: "${APP_HOST:-localhost:3000}"
-      DATABASE_URL: "postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:-user123}@postgres:5432/coursewave_db"
-      AUTO_CREATE_TABLES: "true"
-
-      JWT_SECRET: "${JWT_SECRET:-dev-jwt-secret}"
-      COOKIE_SECRET: "${COOKIE_SECRET:-dev-cookie-secret}"
-      ACCESS_TOKEN_EXPIRY: "7m"
-      REFRESH_TOKEN_EXPIRY: "7d"
-      REFRESH_TOKEN_MAX_AGE_SECONDS: "604800"
-      AUTH_EXCLUDE_PATHS: "/health,/auth/api/v1/token-refresh,/student/api/v1/login,/student/api/v1/register,/student/api/v1/email,/student/api/v1/password-reset,/student/api/v1/verify-email"
-
-      CORS_ORIGIN: "*"
-      CORS_METHODS: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-      CORS_HEADERS: "Content-Type,Authorization,X-Request-ID"
-      CORS_CREDENTIALS: "false"
-
-      CACHE_ENABLED: "true"
-      CACHE_TTL_SECONDS: "420"
-      CACHE_EXCLUDE_PATHS: "/health"
-
-      RATE_LIMIT_ENABLED: "true"
-      RATE_LIMIT_MAX: "100"
-      RATE_LIMIT_EXCLUDE_PATHS: "/health"
-      RATELIMIT_ROUTES: '[{"prefix":"/student/api","window_ms":90000,"strategy":"fixed_window"},{"prefix":"*","window_ms":90000,"strategy":"fixed_window"}]'
-
-      REDIS_HOST: "redis"
-      REDIS_PORT: "6379"
-      REDIS_PASSWORD: ""
-      REDIS_DB: "0"
-
-      RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER:-coursewave}:${RABBITMQ_DEFAULT_PASSWORD:-coursewave}@rabbitmq:5672/"
+    environment: *backend-environment
     ports:
       - "3000:8000"
     depends_on:
@@ -115,6 +118,30 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - coursewave
+
+  worker:
+    image: coursewave-backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - celery_app
+      - worker
+      - --loglevel=INFO
+      - --queues=task
+    environment: *backend-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     networks:
       - coursewave
 

@@ -1,16 +1,17 @@
 # CourseWave
 
 CourseWave is a student platform built around a FastAPI backend, PostgreSQL,
-Redis, and RabbitMQ.
+Redis, RabbitMQ, and a Celery worker for asynchronous notification delivery.
 
 ## Services
 
 | Service | Description | Port |
 |---------|-------------|------|
 | `coursewave` | FastAPI backend | `3000` |
+| `worker` | Celery worker for notification tasks | - |
 | `postgres` | PostgreSQL 17 with `coursewave_db` | `5432` |
-| `redis` | Sessions, cache, rate limits, verification tokens | `6379` |
-| `rabbitmq` | Provisioned message broker | `5672`, `15672` |
+| `redis` | Sessions, cache, rate limits, verification tokens, notification locks | `6379` |
+| `rabbitmq` | Task broker with quorum queues and a dead-letter queue | `5672`, `15672` |
 
 ## Quick Start
 
@@ -25,8 +26,8 @@ at `http://localhost:3000/docs` and requires a Bearer access token.
 ## Backend
 
 See [`backend/README.md`](backend/README.md) for configuration, middleware
-behavior, the authentication and refresh-token contracts, and testing
-instructions.
+behavior, the authentication and refresh-token contracts, the notification
+task flow and queue topology, and testing instructions.
 
 ## Tests
 

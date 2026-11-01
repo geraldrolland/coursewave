@@ -1,9 +1,5 @@
 """Shared model helpers."""
 
-from datetime import datetime, timezone
+from app.base_utils import utc_now
 
-
-def utc_now() -> datetime:
-    """Return the current timezone-aware UTC datetime."""
-
-    return datetime.now(timezone.utc)
+__all__ = ["utc_now"]

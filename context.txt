@@ -9,6 +9,8 @@ requested refinements:
 - Configurable prefix-based rate limiting with a strategy-to-handler registry.
 - Student auth methods (EMAIL | GOOGLE) with nullable password hashes.
 - Removal of the transactional outbox model.
+- A notification model and Celery task backed by RabbitMQ queues, Redis locks,
+  retries, and a dead-letter queue.
 - The backend is the public API; api_gateway/ has been deleted.
 - RabbitMQ replaces Kafka.
 - No Docker containers are started during development/validation.
@@ -44,8 +46,7 @@ Rate limiting
 - Unmatched paths use the fallback
   {"prefix": "*", "window_ms": 90000, "strategy": "fixed_window"}.
 - Match request paths against configured prefixes in list order; the first
-  matching prefix wins. `*` matches any path, and unmatched paths use the
-  built-in `{"window_ms": 90000, "strategy": "fixed_window"}` fallback.
+  matching prefix wins. `*` matches any path.
 - Resolve strategy through backend/app/middleware/ratelimit/ratelimiter_registry.py.
 - RATELIMITER_REGISTRY maps both fixed_window and token_bucket to async handlers.
 - Handlers take the request and window_ms and return bool.
@@ -61,6 +62,72 @@ Rate limiting
 - Unknown strategies log a warning and fall back to fixed_window.
 - Redis failures fail open.
 
+Notifications and Celery
+- New service at backend/app/services/notification/ with exception/, model/,
+  and tasks.py.
+- Notification (table "notification") fields:
+    notification_id: UUID primary key (uuid4)
+    type: NotificationType EMAIL = "email", PUSH = "push", SMS = "sms"
+    payload: JSON object
+    belongs_to: NotificationAudience STUDENT = "student",
+                INSTRUCTOR = "instructor", ADMIN = "admin"
+    user_id: UUID, indexed
+    status: NotificationStatus PENDING = "pending",
+            PROCESSED = "processed", FAILED = "failed"
+    release_after: timezone-aware datetime, indexed, defaults to now
+    created_at / updated_at: timezone-aware datetimes
+- Database enum names: notification_type, notification_audience, and
+  notification_status. They store lowercase values.
+- Notification.send() is a synchronous no-op placeholder. Real delivery code may
+  raise NotificationError.
+- Celery configuration lives in backend/celery_app.py. It imports
+  app.services.notification.tasks and exposes `app` for
+  `celery -A celery_app`.
+- Task name: notification.process_notification. Task options:
+    max_retries=5
+    default_retry_delay=10
+    retry_backoff=10
+    retry_jitter=True
+    autoretry_for=(NotificationError,)
+    acks_late=True
+    reject_on_worker_lost=True
+    acks_on_failure_or_timeout=False
+- Global worker settings also set acks_late, reject_on_worker_lost,
+  acks_on_failure_or_timeout=False, and worker_prefetch_multiplier=1.
+- process_notification takes notification_id and runs its async database/Redis
+  work with asyncio.run. The cached PostgreSQL engine is disposed and its cache
+  cleared after each task.
+- Task flow:
+    1. Acquire Redis process lock notification:process:<id>, TTL 120 seconds.
+    2. If busy, load the notification and retry with
+       countdown=max(0, release_after - now). Return if the row is missing.
+    3. Load the notification. Set release_after = now + 120 seconds and commit.
+    4. Return if status is already processed.
+    5. Acquire Redis commit lock notification:commit:<id>, TTL 120 seconds.
+    6. If the commit lock is busy, retry after the updated release_after.
+    7. Call notification.send().
+    8. Success: set status=processed and commit.
+    9. NotificationError before the last attempt: re-raise so Celery autoretries
+       with exponential backoff and jitter.
+    10. NotificationError on the last attempt: set status=failed, commit, then
+        raise Reject(requeue=False) from the original error.
+- Both locks are released in finally blocks on success, retry, or reject.
+- Queue topology:
+    task: quorum queue, x-delivery-limit=5, dead-letter exchange task.dlx,
+          dead-letter routing key task.dlq
+    task.dlq: quorum queue, x-delivery-limit=-1
+- Exchanges are topic exchanges so Celery uses RabbitMQ native delayed delivery
+  for retry countdowns. Celery 5.5+ is required; the installed version is
+  5.6.3.
+- broker_native_delayed_delivery_queue_type is explicitly "quorum".
+- The worker declares all configured queues on the worker_init signal because
+  it consumes only `task` and would otherwise not declare task.dlq. The worker
+  command is:
+    celery -A celery_app worker --loglevel=INFO --queues=task
+- A worker service using the backend image and shared environment anchor was
+  added to docker-compose.yml. It waits for Redis, PostgreSQL, and RabbitMQ to
+  become healthy.
+
 Prior decisions that remain in place
 - Student registration remains public and unchanged.
 - Student.auth_method is an AuthMethod enum with EMAIL = "email" and
@@ -69,8 +136,7 @@ Prior decisions that remain in place
 - Student.password_hash is nullable with a NULL default, but email
   registration still hashes and stores a password.
 - register_student sets auth_method=AuthMethod.EMAIL explicitly.
-- The Outbox model and all outbox writes are removed. RabbitMQ remains
-  provisioned in Compose but is currently unused.
+- The Outbox model and all outbox writes are removed.
 - New error bodies use {"detail": "..."}.
 - Compose service is named coursewave, builds ./backend, publishes 3000:8000.
 - RabbitMQ replaces Kafka; Kafka and api_gateway/ are removed.
@@ -83,6 +149,8 @@ Prior decisions that remain in place
 - Middleware order is
   CORS -> RequestLogger -> Auth -> RateLimit -> RefreshToken -> Cache -> routes.
 - Do not start Docker Desktop or any containers.
+- utc_now lives in backend/app/base_utils and is re-exported by
+  app.services.student.model.base for existing imports.
 
 
 Current Work State
@@ -92,47 +160,23 @@ Completed
   added DEFAULT_RATELIMIT_ROUTES.
 - Removed rate_limit_window_ms and RATE_LIMIT_WINDOW_MS from code,
   backend/.env.example, docker-compose.yml, and documentation.
-- Added backend/app/middleware/ratelimit/ratelimiter_registry.py.
-- Converted fixed-window and token-bucket limiters into async handler functions
-  with bool returns and RateLimitResult state metadata.
-- Rewrote rate-limit middleware for first-match prefix routing, wildcard
-  fallback, registry lookup, state metadata, headers, 429 responses, and Redis
-  fail-open.
-- Converted RateLimitMiddleware to Starlette BaseHTTPMiddleware with first-match
-  prefix routing and removed parse_ratelimit_routes and its normalization
-  helpers.
-- Converted AuthMiddleware, CacheMiddleware, RefreshTokenMiddleware, and
-  RequestLoggerMiddleware to BaseHTTPMiddleware dispatch. CORS remains the
-  built-in CORSMiddleware.
-- Preserved cache behavior for JSON-only storage, X-Cache, the 1 MiB limit,
-  Redis fail-open, and streaming pass-through; added a multi-chunk JSON
-  streaming regression test.
-- Added CACHE_ROUTES = ("/student/api/v1", "/instructor/api/v1") as the cache
-  allowlist with segment-aware prefix matching. Non-matching paths bypass Redis
-  and receive no X-Cache header.
-- Moved cache tests under the /student/api/v1 prefix and added coverage for
-  /instructor/api/v1, unmatched paths, and the /student/api/v10 boundary.
-- Added AuthMethod (EMAIL = "email", GOOGLE = "google") to the Student model
-  and exported it from the student model package.
-- Made Student.password_hash nullable with a NULL default and added a
-  non-nullable auth_method column defaulting to AuthMethod.EMAIL.
-- Set auth_method=AuthMethod.EMAIL explicitly during registration while still
-  hashing and storing the password.
-- Deleted backend/app/services/student/model/outbox.py, removed Outbox imports
-  from main.py and the student model package, and removed outbox creation from
-  the registration transaction.
-- Removed the dead build_verification_link helper and its test; APP_HOST remains
-  configured.
-- Updated registration tests for auth-method defaults, nullable password hashes,
-  and outbox-free registration.
-- Added exact application/json filtering to cache storage, cache reads, and
-  response buffering.
-- Rewrote/expanded backend/tests/test_rate_limit.py and test_cache.py.
-- Updated backend/.env.example, docker-compose.yml, and backend/README.md.
-- Removed the gateway, proxy-signature middleware, and their tests/config.
-- Implemented auth, CORS, refresh-token, cache, and rate-limit middleware.
-- Implemented JWT/cookie helpers and Redis session lookup.
-- RabbitMQ is provisioned in Compose in place of Kafka.
+- Added the rate-limiter registry, async handler functions, and BaseHTTPMiddleware
+  conversions for Auth, Cache, RateLimit, RefreshToken, and RequestLogger.
+- Added the CACHE_ROUTES allowlist, JSON-only cache storage, and the related
+  tests.
+- Added AuthMethod, nullable password_hash, and removed the Outbox model and
+  registration-side outbox writes.
+- Created the notification service, Notification model, NotificationError, and
+  process_notification task.
+- Added backend/celery_app.py with quorum queues, DLX/DLQ routing, retry/ack
+  settings, the task route, and worker queue declaration.
+- Imported Notification in app/main.py so create_all includes the table.
+- Added Celery to requirements.txt and updated the Dockerfile to copy
+  celery_app.py.
+- Added the worker service and a shared backend environment anchor to
+  docker-compose.yml.
+- Added FakeLock/FakeRedis.lock and backend/tests/test_notification.py.
+- Updated backend/README.md, README.md, and this context file.
 
 Active
 - None.
@@ -141,32 +185,36 @@ Blocked
 - None.
 
 Next Move
-- None. Auth, Cache, RefreshToken, and RequestLogger now use BaseHTTPMiddleware;
-  no further implementation is pending.
+- None. The notification/Celery implementation is complete and validated.
+
 
 Known Gaps
+- No notification enqueue endpoint or scheduler exists; another component must
+  insert Notification rows and submit the task.
+- Notification.send() is a no-op, so successful tasks currently mark rows
+  processed without external delivery.
 - No login/token-issuer endpoint exists; auth validates existing access tokens
   and refresh rotates existing sessions only.
-- RabbitMQ is provisioned, but no publisher/consumer is implemented and nothing
-  currently writes messages.
-- No migration framework exists. Existing databases need a manual migration to
-  add the student.auth_method column and drop the outbox table; create_all only
-  creates missing tables on a fresh database.
+- No migration framework exists. Existing databases need the notification table
+  created manually because create_all only creates missing tables on a fresh
+  database.
 
 
 Validation Results
 ------------------
-- pytest -q: 112 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 124 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
-- Student model exposes AuthMethod and the nullable password_hash/auth_method
-  columns; registration tests pass.
-- Auth, Cache, RefreshToken, and RequestLogger subclass BaseHTTPMiddleware.
-- RATELIMIT_ROUTES JSON environment parsing verified.
+- Celery import prints: notification.process_notification and task.
+- Queue inspection prints:
+    task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
+    task: topic exchange task, quorum, x-delivery-limit=5, DLX task.dlx,
+          routing key task.dlq
+- celery_app.conf.task_default_exchange_type is "topic" and
+  broker_native_delayed_delivery_queue_type is "quorum".
 - docker compose config --quiet: passed.
-- Compose services: coursewave, postgres, redis, rabbitmq; ports 3000:8000;
-  old RATE_LIMIT_ROUTES and RATE_LIMIT_WINDOW_MS are absent.
+- Compose services: coursewave, worker, postgres, redis, rabbitmq.
 - No containers or Docker Desktop were started.
 
 
@@ -174,58 +222,53 @@ Relevant Files
 --------------
 - backend/app/base_config.py
   Settings, DEFAULT_AUTH_EXCLUDE_PATHS, DEFAULT_RATELIMIT_ROUTES,
-  ratelimit_routes native list, and split_csv helper.
+  ratelimit_routes native list, rabbitmq_url, and split_csv helper.
+- backend/app/base_utils/__init__.py
+  Shared utc_now helper used by the student and notification models.
 - backend/app/main.py
-  create_app, lifespan, Redis provider, route registration, and middleware order.
+  create_app, lifespan, Redis provider, route registration, middleware order,
+  and Notification import for table creation.
 - backend/app/security.py
   Argon2, JWT creation/verification, duration parsing, Express-compatible
   signed-cookie helpers.
 - backend/app/middleware/auth.py
-  BaseHTTPMiddleware bearer JWT validation and Redis session loading into
-  request.state.user.
-- backend/app/middleware/cors.py
-  Starlette CORSMiddleware configuration.
+  BaseHTTPMiddleware bearer JWT validation and Redis session loading.
 - backend/app/middleware/cache.py
-  BaseHTTPMiddleware JSON-only Redis response cache, CACHE_ROUTES allowlist,
-  and X-Cache handling.
+  BaseHTTPMiddleware JSON-only Redis response cache and CACHE_ROUTES allowlist.
 - backend/app/middleware/refresh_token.py
-  BaseHTTPMiddleware POST /auth/api/v1/token-refresh rotation handler.
-- backend/app/middleware/ratelimit/__init__.py
+  BaseHTTPMiddleware token refresh rotation handler.
+- backend/app/middleware/ratelimit/
   BaseHTTPMiddleware dispatch, prefix/wildcard matching, registry dispatch,
-  headers, and 429 responses.
-- backend/app/middleware/ratelimit/ratelimiter_registry.py
-  dict[str, RateLimiterHandler] mapping fixed_window and token_bucket.
-- backend/app/middleware/ratelimit/fixed_window.py
-  fixed_window_limit handler using Redis INCR/EXPIRE.
-- backend/app/middleware/ratelimit/token_bucket.py
-  token_bucket_limit handler using a Redis Lua script.
-- backend/app/middleware/ratelimit/utils.py
-  RateLimitResult, client_identifier, rate_limit_headers.
+  fixed-window and token-bucket handlers, headers, and 429 responses.
 - backend/app/middleware/request_logger.py
-  BaseHTTPMiddleware request logging without proxy-signature logic.
+  BaseHTTPMiddleware request logging.
 - backend/app/services/student/model/student.py
-  Student SQLModel with AuthMethod, nullable password_hash, and the
-  non-nullable auth_method enum column.
-- backend/app/services/student/model/__init__.py
-  Exports AuthMethod and Student.
-- backend/app/services/student/model/outbox.py
-  Deleted.
+  Student SQLModel with AuthMethod, nullable password_hash, and auth_method.
 - backend/app/services/student/router/student.py
-  Public registration route that sets auth_method=AuthMethod.EMAIL, plus
-  student endpoints.
+  Public registration route and student endpoints.
+- backend/app/services/notification/model/notification.py
+  Notification SQLModel, NotificationType/Audience/Status enums, JSON payload,
+  release_after, timestamps, and the send() placeholder.
+- backend/app/services/notification/exception/__init__.py
+  NotificationServiceError and NotificationError.
+- backend/app/services/notification/tasks.py
+  process_notification task, lock flow, retry handling, and final Reject.
+- backend/celery_app.py
+  Celery app, queue/DLX/DLQ declarations, retry and ack settings, task route,
+  and the worker_init queue declaration.
 - backend/tests/fakes.py
-  Async FakeRedis test double, including token-bucket eval and failure injection.
-- backend/tests/helpers.py
-  Shared settings, JWT, session, and signed-cookie helpers.
-- backend/tests/test_auth.py, test_cors.py, test_cache.py, test_rate_limit.py,
-  test_refresh.py, test_security.py, test_register.py, test_request_logger.py
-  Test coverage for the middleware and existing registration behavior.
-- backend/.env.example
-  RATELIMIT_ROUTES JSON example plus auth/CORS/cache/RabbitMQ settings.
+  Async FakeRedis and FakeLock test doubles with failure injection.
+- backend/tests/test_notification.py
+  Model, queue topology, worker declaration, lock, retry, and failure tests.
+- backend/requirements.txt
+  FastAPI, Celery, SQLModel, Redis, asyncpg, and auth dependencies.
+- backend/Dockerfile
+  Installs requirements, copies app and celery_app.py, and runs uvicorn.
 - docker-compose.yml
-  coursewave, postgres, redis, rabbitmq; publishes 3000:8000.
-- backend/README.md
-  Architecture, middleware order, auth, cache, and rate-limit documentation.
+  coursewave, worker, postgres, redis, and rabbitmq; shared backend environment.
+- backend/README.md and README.md
+  Architecture, middleware, auth, cache, rate-limit, notification, Celery, and
+  testing documentation.
 - api_gateway/
   Deleted.
 
@@ -239,30 +282,27 @@ Important Context
 - Refresh: signed cookie refresh=s:<JWT>.<HMAC-SHA256 base64 without padding>
   using COOKIE_SECRET. The refresh JWT uses JWT_SECRET, type must be "refresh",
   and the session TTL is extended to 604800 seconds. New access and refresh
-  tokens reuse the same session ID. Cookie attributes: HttpOnly, Secure,
-  SameSite=Strict, Path=/auth/api/v1/token-refresh, Max-Age=604800.
+  tokens reuse the same session ID.
 - Cache routes: CACHE_ROUTES = ("/student/api/v1", "/instructor/api/v1") in
-  cache.py. Matching is segment-aware; non-matching paths skip Redis and have
-  no X-Cache header. Cache key is cache:<path>[?<query>].
-- RequestLogger measures duration until the response object is produced, so
-  streamed body transfer time is not included.
+  cache.py. Matching is segment-aware; cache key is cache:<path>[?<query>].
 - Rate-limit keys: ratelimit:<strategy>:<prefix>:<identifier>.
 - Identifiers: authenticated session userId, otherwise socket IP.
-- Default RATE_LIMIT_MAX is 100.
-- Token-bucket capacity is RATE_LIMIT_MAX and refills RATE_LIMIT_MAX tokens
-  over the route window_ms.
-- RATELIMIT_ROUTES is supplied as JSON in the environment and parsed by
-  pydantic-settings into a list of dicts.
+- Student auth: AuthMethod.EMAIL.value == "email" and
+  AuthMethod.GOOGLE.value == "google". password_hash is str | None.
+- Notification enums store lowercase values; Notification.status defaults to
+  pending and release_after defaults to the current UTC time.
+- Notification lock keys: notification:process:<id> and
+  notification:commit:<id>, both with a 120-second TTL.
+- Retry countdowns use retry_backoff=10 with full jitter, so the nominal delays
+  are 10, 20, 40, 80, and 160 seconds, capped at 600 seconds.
+- Celery self.retry publishes a new message, so RabbitMQ x-delivery-limit=5
+  covers broker redeliveries (worker crashes/requeues), not application
+  retries. The final Reject(requeue=False) sends exhausted application failures
+  to task.dlq immediately.
+- The worker consumes only task; task.dlq is not consumed.
 - Compose service publishes host port 3000 to container port 8000.
 - Registration remains public at /student/api/v1/register.
-- Student auth: AuthMethod.EMAIL.value == "email" and
-  AuthMethod.GOOGLE.value == "google". The auth_method column is non-nullable
-  and defaults to AuthMethod.EMAIL.
-- password_hash is str | None with a NULL default; registration still stores an
-  Argon2 hash for email accounts, and future Google accounts can leave it null.
-- Registration stores the verification token in Redis with a 120-second TTL but
-  no longer enqueues an outbox event or builds an email verification link.
 - All new error responses use {"detail": "..."}.
-- The repository root C:\Users\USER\coursewave is the git repository; the
+- The repository root C:\Users\USER\CourseWave is the git repository; the
   remote is https://github.com/geraldrolland/coursewave.git (main).
 - api_gateway/ was its own repository and has been removed permanently.

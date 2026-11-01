@@ -16,6 +16,8 @@ directly.
 - Validated student registration with Argon2 password hashing.
 - Redis-backed email verification tokens with a 120-second TTL.
 - `EMAIL` and `GOOGLE` authentication methods with nullable password hashes.
+- Asynchronous notification processing through Celery, RabbitMQ quorum queues,
+  and Redis locks.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -44,11 +46,16 @@ backend/
 │   │   └── request_logger.py
 │   ├── redis_config/
 │   └── services/
+│       ├── notification/
+│       │   ├── exception/
+│       │   ├── model/
+│       │   └── tasks.py
 │       └── student/
 │           ├── exception/
 │           ├── model/
 │           ├── router/
 │           └── schema/
+├── celery_app.py
 ├── tests/
 ├── .env.example
 ├── requirements.txt
@@ -60,8 +67,7 @@ backend/
 ### Prerequisites
 
 - Python 3.12+
-- PostgreSQL and Redis when running outside Docker Compose
-- RabbitMQ is provisioned in the Compose stack for future asynchronous messaging
+- PostgreSQL, Redis, and RabbitMQ when running outside Docker Compose
 
 ### Installation
 
@@ -103,12 +109,19 @@ Copy-Item .env.example .env
 | `REDIS_DB` | Redis database number | `0` |
 | `AUTO_CREATE_TABLES` | Create missing SQLModel tables at startup | `false` |
 | `DATABASE_URL` | Optional SQLAlchemy database URL override | `postgresql+asyncpg://postgres:user123@localhost:5432/coursewave_db` |
-| `RABBITMQ_URL` | Broker URL for future asynchronous messaging | `amqp://guest:guest@localhost:5672/` |
+| `RABBITMQ_URL` | Broker URL used by the Celery worker | `amqp://guest:guest@localhost:5672/` |
 
 ### Run
 
 ```powershell
 .venv\Scripts\python -m uvicorn app.main:app --reload --port 8000
+```
+
+Start the notification worker in a second terminal after PostgreSQL, Redis, and
+RabbitMQ are available:
+
+```powershell
+.venv\Scripts\celery.exe -A celery_app worker --loglevel=INFO --queues=task
 ```
 
 ### Docker Compose
@@ -119,11 +132,13 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Compose starts four services:
+Compose starts five services:
 
 - `coursewave` - this API, published on `http://localhost:3000`
+- `worker` - the Celery worker consuming the `task` queue
 - `postgres` - PostgreSQL with the `coursewave_db` database
-- `redis` - sessions, cache, rate-limit counters, verification tokens
+- `redis` - sessions, cache, rate-limit counters, verification tokens, and
+  notification locks
 - `rabbitmq` - broker with the management UI on `http://localhost:15672`
 
 ## Middleware
@@ -357,6 +372,66 @@ Errors:
 If the database transaction fails after the Redis token is written, the token is
 deleted on a best-effort basis.
 
+## Notifications
+
+Notifications are persisted in the `notification` table and delivered by the
+`notification.process_notification` Celery task.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `notification_id` | UUID | Primary key |
+| `type` | `email`, `push`, `sms` | `NotificationType` |
+| `payload` | JSON object | Channel-specific data |
+| `belongs_to` | `student`, `instructor`, `admin` | `NotificationAudience` |
+| `user_id` | UUID | Recipient identifier; indexed |
+| `status` | `pending`, `processed`, `failed` | Defaults to `pending` |
+| `release_after` | timezone-aware datetime | Earliest retry time; indexed |
+| `created_at`, `updated_at` | timezone-aware datetimes | Audit timestamps |
+
+`Notification.send()` is a synchronous placeholder and currently returns
+without delivering anything. Real channel integrations should raise
+`NotificationError` when delivery fails.
+
+### Task flow
+
+`process_notification(notification_id)`:
+
+1. Acquires the Redis lock `notification:process:<id>` with a 120-second TTL.
+2. If the lock is held, retries after `release_after` (never less than zero).
+3. Loads the notification and sets `release_after = now + 120 seconds`.
+4. Returns if the status is already `processed`.
+5. Acquires the Redis lock `notification:commit:<id>` with a 120-second TTL.
+   If it is held, retries after the updated `release_after`.
+6. Calls `notification.send()`.
+7. On success, marks the notification `processed`.
+8. On `NotificationError`, retries with 10 seconds of exponential backoff and
+   jitter (`max_retries=5`). After the final attempt it marks the notification
+   `failed` and rejects the message without requeue so RabbitMQ routes it to
+   `task.dlq`.
+
+Both locks are released in `finally` blocks, including when a retry or reject is
+raised.
+
+### Queue topology
+
+- `task` - main quorum queue with `x-delivery-limit=5`; dead-letters to
+  `task.dlx` with routing key `task.dlq`.
+- `task.dlq` - quorum dead-letter queue with no delivery limit. The worker does
+  not consume it.
+- Both exchanges are topic exchanges, so Celery can use RabbitMQ native delayed
+  delivery for retry countdowns instead of holding messages in a worker.
+- `task_acks_late=True`, `task_reject_on_worker_lost=True`, and
+  `task_acks_on_failure_or_timeout=False` make worker crashes requeue messages
+  so the delivery limit eventually moves poison messages to the DLQ.
+- The worker declares both queues before consuming and only consumes `task`:
+
+  ```powershell
+  .venv\Scripts\celery.exe -A celery_app worker --loglevel=INFO --queues=task
+  ```
+
+There is no enqueue endpoint or scheduler yet. Another component must insert a
+`Notification` row and submit `notification.process_notification` with its ID.
+
 ## API
 
 | Method | Path | Description | Authentication |
@@ -376,15 +451,21 @@ deleted on a best-effort basis.
 The suite covers authentication, CORS, caching, rate limiting, refresh-token
 rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
-duplicate-email handling, and student auth-method defaults.
+duplicate-email handling, student auth-method defaults, notification model
+defaults, Celery queue topology, lock handling, retry behavior, and final
+failure handling.
 
 ## Known Limitations
 
 - There is no login or token-issuance endpoint in this repository. Access and
   refresh tokens must be issued by another service that creates the matching
   Redis session.
-- RabbitMQ is provisioned in Compose, but this repository does not yet publish
-  or consume messages.
+- There is no notification enqueue endpoint or scheduler. Notification rows
+  must be created and submitted by another component, and `send()` is a no-op
+  until delivery channels are implemented.
+- There is no migration framework. Existing databases need the `notification`
+  table created manually because `AUTO_CREATE_TABLES` only creates missing
+  tables on a fresh database.
 
 ## License
 

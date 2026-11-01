@@ -6,6 +6,44 @@ from typing import Any
 from redis.exceptions import RedisError
 
 
+class FakeLock:
+    """Small in-memory subset of ``redis.asyncio.lock.Lock``."""
+
+    def __init__(
+        self,
+        redis: "FakeRedis",
+        name: str,
+        timeout: int | None = None,
+    ) -> None:
+        self.redis = redis
+        self.name = name
+        self.timeout = timeout
+        self.owned = False
+
+    async def acquire(self, blocking: bool = True) -> bool:
+        self.redis._record("lock_acquire", self.name)
+        if self.name in self.redis.values:
+            return False
+
+        await self.redis.set(
+            self.name,
+            "lock",
+            ex=self.timeout,
+            nx=True,
+        )
+        self.owned = True
+        return True
+
+    async def release(self) -> None:
+        self.redis._record("lock_release", self.name)
+        if not self.owned:
+            return
+
+        self.redis.values.pop(self.name, None)
+        self.redis.ttls.pop(self.name, None)
+        self.owned = False
+
+
 class FakeRedis:
     """Small in-memory subset of ``redis.asyncio.Redis``.
 
@@ -21,6 +59,16 @@ class FakeRedis:
         self.failures: dict[str, Exception] = {}
         self.fail_all: Exception | None = None
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def lock(
+        self,
+        name: str,
+        timeout: int | None = None,
+        blocking_timeout: float | None = None,
+    ) -> FakeLock:
+        """Return a fake Redis lock for ``name``."""
+
+        return FakeLock(self, name, timeout)
 
     def fail(self, operation: str, error: Exception | None = None) -> None:
         """Make the next calls to ``operation`` raise ``error``."""
