@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -26,15 +26,6 @@ logger = logging.getLogger("notification_service.tasks")
 NOTIFICATION_LOCK_TTL_SECONDS = 120
 
 
-def _retry_delay(release_after: datetime) -> float:
-    """Return a non-negative delay until ``release_after``."""
-
-    if release_after.tzinfo is None:
-        release_after = release_after.replace(tzinfo=timezone.utc)
-
-    return max(0.0, (release_after - utc_now()).total_seconds())
-
-
 async def _release_lock(lock: Any) -> None:
     """Release a Redis lock without masking the task result."""
 
@@ -53,30 +44,19 @@ async def _process_notification(
     redis: Redis,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Acquire locks, deliver, and persist the notification state."""
+    """Acquire the process lock, deliver, and persist the notification state."""
 
     process_lock = redis.lock(
         f"notification:process:{notification_id}",
         timeout=NOTIFICATION_LOCK_TTL_SECONDS,
     )
     if not await process_lock.acquire(blocking=False):
-        async with session_factory() as session:
-            notification = await session.get(Notification, notification_id)
-
-        if notification is None:
-            logger.warning(
-                "Notification %s is locked but no longer exists",
-                notification_id,
-            )
-            return
-
-        delay = _retry_delay(notification.release_after)
         logger.info(
-            "Notification %s is already processing; retrying in %.2fs",
+            "Notification %s is already processing; retrying in %s seconds",
             notification_id,
-            delay,
+            NOTIFICATION_LOCK_TTL_SECONDS,
         )
-        raise task.retry(countdown=delay)
+        raise task.retry(countdown=NOTIFICATION_LOCK_TTL_SECONDS)
 
     try:
         async with session_factory() as session:
@@ -94,46 +74,30 @@ async def _process_notification(
                 logger.info("Notification %s is already processed", notification_id)
                 return
 
-            commit_lock = redis.lock(
-                f"notification:commit:{notification_id}",
-                timeout=NOTIFICATION_LOCK_TTL_SECONDS,
-            )
-            if not await commit_lock.acquire(blocking=False):
-                delay = _retry_delay(notification.release_after)
-                logger.info(
-                    "Commit lock for notification %s is busy; retrying in %.2fs",
-                    notification_id,
-                    delay,
-                )
-                raise task.retry(countdown=delay)
-
             try:
-                try:
-                    notification.send()
-                except NotificationError as exc:
-                    if task.request.retries >= task.max_retries:
-                        notification.status = NotificationStatus.FAILED
-                        await session.commit()
-                        logger.error(
-                            "Notification %s failed after %s retries",
-                            notification_id,
-                            task.request.retries,
-                        )
-                        raise Reject(str(exc), requeue=False) from exc
-
-                    logger.info(
-                        "Notification %s failed; retry %s of %s",
+                notification.send()
+            except NotificationError as exc:
+                if task.request.retries >= task.max_retries:
+                    notification.status = NotificationStatus.FAILED
+                    await session.commit()
+                    logger.error(
+                        "Notification %s failed after %s retries",
                         notification_id,
-                        task.request.retries + 1,
-                        task.max_retries,
+                        task.request.retries,
                     )
-                    raise
+                    raise Reject(str(exc), requeue=False) from exc
 
-                notification.status = NotificationStatus.PROCESSED
-                await session.commit()
-                logger.info("Notification %s processed", notification_id)
-            finally:
-                await _release_lock(commit_lock)
+                logger.info(
+                    "Notification %s failed; retry %s of %s",
+                    notification_id,
+                    task.request.retries + 1,
+                    task.max_retries,
+                )
+                raise
+
+            notification.status = NotificationStatus.PROCESSED
+            await session.commit()
+            logger.info("Notification %s processed", notification_id)
     finally:
         await _release_lock(process_lock)
 

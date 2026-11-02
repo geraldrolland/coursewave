@@ -397,20 +397,19 @@ without delivering anything. Real channel integrations should raise
 `process_notification(notification_id)`:
 
 1. Acquires the Redis lock `notification:process:<id>` with a 120-second TTL.
-2. If the lock is held, retries after `release_after` (never less than zero).
+2. If the lock is held, retries with the same 120-second lock TTL as its
+   countdown.
 3. Loads the notification and sets `release_after = now + 120 seconds`.
 4. Returns if the status is already `processed`.
-5. Acquires the Redis lock `notification:commit:<id>` with a 120-second TTL.
-   If it is held, retries after the updated `release_after`.
-6. Calls `notification.send()`.
-7. On success, marks the notification `processed`.
-8. On `NotificationError`, retries with 10 seconds of exponential backoff and
+5. Calls `notification.send()`.
+6. On success, marks the notification `processed`.
+7. On `NotificationError`, retries with 10 seconds of exponential backoff and
    jitter (`max_retries=5`). After the final attempt it marks the notification
    `failed` and rejects the message without requeue so RabbitMQ routes it to
    `task.dlq`.
 
-Both locks are released in `finally` blocks, including when a retry or reject is
-raised.
+The process lock is released in a `finally` block, including when a retry or
+reject is raised.
 
 ### Queue topology
 

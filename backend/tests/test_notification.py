@@ -1,7 +1,6 @@
 """Tests for the notification model, Celery configuration, and task."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -10,7 +9,6 @@ import pytest
 from celery.exceptions import Reject
 
 from app.base_config import get_settings
-from app.base_utils import utc_now
 from app.services.notification.exception import NotificationError
 from app.services.notification.model import (
     Notification,
@@ -21,7 +19,6 @@ from app.services.notification.model import (
 from app.services.notification.tasks import (
     NOTIFICATION_LOCK_TTL_SECONDS,
     _process_notification,
-    _retry_delay,
     process_notification,
 )
 from celery_app import celery_app, declare_queues
@@ -245,9 +242,7 @@ def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -
         assert redis.ttls[
             f"notification:process:{self.notification_id}"
         ] == NOTIFICATION_LOCK_TTL_SECONDS
-        assert redis.ttls[
-            f"notification:commit:{self.notification_id}"
-        ] == NOTIFICATION_LOCK_TTL_SECONDS
+        assert f"notification:commit:{self.notification_id}" not in redis.values
 
     monkeypatch.setattr(Notification, "send", fake_send)
 
@@ -302,9 +297,8 @@ def test_already_processed_notification_is_skipped(
     assert f"notification:commit:{notification.notification_id}" not in redis.values
 
 
-def test_process_lock_busy_retries_until_release_after() -> None:
+def test_process_lock_busy_retries_with_lock_ttl() -> None:
     notification = make_notification()
-    notification.release_after = utc_now() + timedelta(seconds=30)
     redis = FakeRedis()
     redis.seed(f"notification:process:{notification.notification_id}", "other")
     factory = FakeSessionFactory(notification)
@@ -320,35 +314,10 @@ def test_process_lock_busy_retries_until_release_after() -> None:
             )
         )
 
-    assert 28 <= (exc_info.value.countdown or 0) <= 30
+    assert exc_info.value.countdown == NOTIFICATION_LOCK_TTL_SECONDS
     assert exc_info.value.exc is None
-    assert task.retry_calls[0][0] is not None
+    assert task.retry_calls[0][0] == NOTIFICATION_LOCK_TTL_SECONDS
     assert factory.commits == []
-
-
-def test_commit_lock_busy_retries_and_releases_process_lock() -> None:
-    notification = make_notification()
-    notification.release_after = utc_now()
-    redis = FakeRedis()
-    redis.seed(f"notification:commit:{notification.notification_id}", "other")
-    factory = FakeSessionFactory(notification)
-    task = FakeTask()
-
-    with pytest.raises(RetryCalled) as exc_info:
-        asyncio.run(
-            _process_notification(
-                task,
-                notification.notification_id,
-                redis,
-                factory,
-            )
-        )
-
-    assert 118 <= (exc_info.value.countdown or 0) <= 120
-    assert notification.status is NotificationStatus.PENDING
-    assert f"notification:process:{notification.notification_id}" not in redis.values
-    assert f"notification:commit:{notification.notification_id}" in redis.values
-    assert factory.commits == [NotificationStatus.PENDING]
 
 
 def test_notification_error_retries_before_max_retries(
@@ -432,11 +401,3 @@ def test_missing_notification_returns_without_retry() -> None:
 
     assert task.retry_calls == []
     assert not any(key.startswith("notification:process:") for key in redis.values)
-
-
-def test_retry_delay_accepts_naive_release_after() -> None:
-    release_after = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
-        seconds=10
-    )
-
-    assert 9 <= _retry_delay(release_after) <= 10

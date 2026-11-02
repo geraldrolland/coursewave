@@ -99,19 +99,17 @@ Notifications and Celery
   cleared after each task.
 - Task flow:
     1. Acquire Redis process lock notification:process:<id>, TTL 120 seconds.
-    2. If busy, load the notification and retry with
-       countdown=max(0, release_after - now). Return if the row is missing.
+    2. If busy, retry with countdown=120 seconds (the lock TTL).
     3. Load the notification. Set release_after = now + 120 seconds and commit.
     4. Return if status is already processed.
-    5. Acquire Redis commit lock notification:commit:<id>, TTL 120 seconds.
-    6. If the commit lock is busy, retry after the updated release_after.
-    7. Call notification.send().
-    8. Success: set status=processed and commit.
-    9. NotificationError before the last attempt: re-raise so Celery autoretries
+    5. Call notification.send().
+    6. Success: set status=processed and commit.
+    7. NotificationError before the last attempt: re-raise so Celery autoretries
        with exponential backoff and jitter.
-    10. NotificationError on the last attempt: set status=failed, commit, then
-        raise Reject(requeue=False) from the original error.
-- Both locks are released in finally blocks on success, retry, or reject.
+    8. NotificationError on the last attempt: set status=failed, commit, then
+       raise Reject(requeue=False) from the original error.
+- There is no commit lock. The process lock is released in a finally block on
+  success, retry, or reject.
 - Queue topology:
     task: quorum queue, x-delivery-limit=5, dead-letter exchange task.dlx,
           dead-letter routing key task.dlq
@@ -168,6 +166,8 @@ Completed
   registration-side outbox writes.
 - Created the notification service, Notification model, NotificationError, and
   process_notification task.
+- Updated process_notification so a busy process lock retries with the
+  120-second lock TTL and removed the commit lock.
 - Added backend/celery_app.py with quorum queues, DLX/DLQ routing, retry/ack
   settings, the task route, and worker queue declaration.
 - Imported Notification in app/main.py so create_all includes the table.
@@ -202,7 +202,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 124 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 122 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -291,8 +291,9 @@ Important Context
   AuthMethod.GOOGLE.value == "google". password_hash is str | None.
 - Notification enums store lowercase values; Notification.status defaults to
   pending and release_after defaults to the current UTC time.
-- Notification lock keys: notification:process:<id> and
-  notification:commit:<id>, both with a 120-second TTL.
+- Notification process lock key: notification:process:<id>, with a 120-second
+  TTL. A busy lock retries after the same 120-second TTL. There is no commit
+  lock.
 - Retry countdowns use retry_backoff=10 with full jitter, so the nominal delays
   are 10, 20, 40, 80, and 160 seconds, capped at 600 seconds.
 - Celery self.retry publishes a new message, so RabbitMQ x-delivery-limit=5
