@@ -48,7 +48,7 @@ task_queue = Queue(
 celery_app = Celery(
     "coursewave",
     broker=settings.rabbitmq_url,
-    imports=("app.services.notification.tasks",),
+    imports=("app.services.notification.task.process_notification",),
 )
 
 celery_app.conf.update(

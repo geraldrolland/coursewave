@@ -16,10 +16,10 @@ from app.services.notification.model import (
     NotificationStatus,
     NotificationType,
 )
-from app.services.notification.tasks import (
+from app.services.notification.task import process_notification
+from app.services.notification.task.process_notification import (
     NOTIFICATION_LOCK_TTL_SECONDS,
     _process_notification,
-    process_notification,
 )
 from celery_app import celery_app, declare_queues
 from tests.fakes import FakeRedis
@@ -116,10 +116,9 @@ def test_notification_model_defaults_and_enums() -> None:
 
     assert notification.notification_id is not None
     assert notification.status is NotificationStatus.PENDING
-    assert notification.release_after.tzinfo is not None
     assert notification.send() is None
     assert Notification.__table__.c.status.nullable is False
-    assert Notification.__table__.c.release_after.nullable is False
+    assert "release_after" not in Notification.__table__.columns
     assert [member.value for member in NotificationType] == [
         "email",
         "push",
@@ -181,7 +180,10 @@ def test_celery_queue_topology() -> None:
         "routing_key": "task",
     }
     assert celery_app.conf.broker_url == get_settings().rabbitmq_url
-    assert "app.services.notification.tasks" in celery_app.conf.imports
+    assert (
+        "app.services.notification.task.process_notification"
+        in celery_app.conf.imports
+    )
 
 
 def test_worker_declares_every_queue(
@@ -231,7 +233,6 @@ def test_worker_declares_every_queue(
 
 def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -> None:
     notification = make_notification()
-    initial_release_after = notification.release_after
     redis = FakeRedis()
     factory = FakeSessionFactory(notification)
     task = FakeTask()
@@ -257,11 +258,7 @@ def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -
 
     assert sent == [notification.notification_id]
     assert notification.status is NotificationStatus.PROCESSED
-    assert notification.release_after > initial_release_after
-    assert factory.commits == [
-        NotificationStatus.PENDING,
-        NotificationStatus.PROCESSED,
-    ]
+    assert factory.commits == [NotificationStatus.PROCESSED]
     assert f"notification:process:{notification.notification_id}" not in redis.values
     assert f"notification:commit:{notification.notification_id}" not in redis.values
 
@@ -292,7 +289,7 @@ def test_already_processed_notification_is_skipped(
 
     assert sent == []
     assert notification.status is NotificationStatus.PROCESSED
-    assert factory.commits == [NotificationStatus.PROCESSED]
+    assert factory.commits == []
     assert f"notification:process:{notification.notification_id}" not in redis.values
     assert f"notification:commit:{notification.notification_id}" not in redis.values
 
@@ -344,7 +341,7 @@ def test_notification_error_retries_before_max_retries(
         )
 
     assert notification.status is NotificationStatus.PENDING
-    assert factory.commits == [NotificationStatus.PENDING]
+    assert factory.commits == []
     assert task.retry_calls == []
     assert f"notification:process:{notification.notification_id}" not in redis.values
     assert f"notification:commit:{notification.notification_id}" not in redis.values
@@ -376,10 +373,7 @@ def test_notification_error_marks_failed_and_rejects_after_max_retries(
     assert exc_info.value.requeue is False
     assert isinstance(exc_info.value.__cause__, NotificationError)
     assert notification.status is NotificationStatus.FAILED
-    assert factory.commits == [
-        NotificationStatus.PENDING,
-        NotificationStatus.FAILED,
-    ]
+    assert factory.commits == [NotificationStatus.FAILED]
     assert task.retry_calls == []
     assert f"notification:process:{notification.notification_id}" not in redis.values
     assert f"notification:commit:{notification.notification_id}" not in redis.values

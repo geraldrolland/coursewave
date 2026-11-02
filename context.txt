@@ -64,7 +64,7 @@ Rate limiting
 
 Notifications and Celery
 - New service at backend/app/services/notification/ with exception/, model/,
-  and tasks.py.
+  and task/process_notification.py.
 - Notification (table "notification") fields:
     notification_id: UUID primary key (uuid4)
     type: NotificationType EMAIL = "email", PUSH = "push", SMS = "sms"
@@ -74,14 +74,13 @@ Notifications and Celery
     user_id: UUID, indexed
     status: NotificationStatus PENDING = "pending",
             PROCESSED = "processed", FAILED = "failed"
-    release_after: timezone-aware datetime, indexed, defaults to now
     created_at / updated_at: timezone-aware datetimes
 - Database enum names: notification_type, notification_audience, and
   notification_status. They store lowercase values.
 - Notification.send() is a synchronous no-op placeholder. Real delivery code may
   raise NotificationError.
 - Celery configuration lives in backend/celery_app.py. It imports
-  app.services.notification.tasks and exposes `app` for
+  app.services.notification.task.process_notification and exposes `app` for
   `celery -A celery_app`.
 - Task name: notification.process_notification. Task options:
     max_retries=5
@@ -100,7 +99,7 @@ Notifications and Celery
 - Task flow:
     1. Acquire Redis process lock notification:process:<id>, TTL 120 seconds.
     2. If busy, retry with countdown=120 seconds (the lock TTL).
-    3. Load the notification. Set release_after = now + 120 seconds and commit.
+    3. Load the notification.
     4. Return if status is already processed.
     5. Call notification.send().
     6. Success: set status=processed and commit.
@@ -168,6 +167,8 @@ Completed
   process_notification task.
 - Updated process_notification so a busy process lock retries with the
   120-second lock TTL and removed the commit lock.
+- Removed Notification.release_after and its task-side update, and moved the
+  process_notification task into notification/task/process_notification.py.
 - Added backend/celery_app.py with quorum queues, DLX/DLQ routing, retry/ack
   settings, the task route, and worker queue declaration.
 - Imported Notification in app/main.py so create_all includes the table.
@@ -197,7 +198,8 @@ Known Gaps
   and refresh rotates existing sessions only.
 - No migration framework exists. Existing databases need the notification table
   created manually because create_all only creates missing tables on a fresh
-  database.
+  database. If the earlier schema exists, drop the unused release_after column
+  manually.
 
 
 Validation Results
@@ -248,11 +250,13 @@ Relevant Files
   Public registration route and student endpoints.
 - backend/app/services/notification/model/notification.py
   Notification SQLModel, NotificationType/Audience/Status enums, JSON payload,
-  release_after, timestamps, and the send() placeholder.
+  timestamps, and the send() placeholder.
 - backend/app/services/notification/exception/__init__.py
   NotificationServiceError and NotificationError.
-- backend/app/services/notification/tasks.py
+- backend/app/services/notification/task/process_notification.py
   process_notification task, lock flow, retry handling, and final Reject.
+- backend/app/services/notification/task/__init__.py
+  Exports the process_notification task.
 - backend/celery_app.py
   Celery app, queue/DLX/DLQ declarations, retry and ack settings, task route,
   and the worker_init queue declaration.
@@ -290,7 +294,7 @@ Important Context
 - Student auth: AuthMethod.EMAIL.value == "email" and
   AuthMethod.GOOGLE.value == "google". password_hash is str | None.
 - Notification enums store lowercase values; Notification.status defaults to
-  pending and release_after defaults to the current UTC time.
+  pending.
 - Notification process lock key: notification:process:<id>, with a 120-second
   TTL. A busy lock retries after the same 120-second TTL. There is no commit
   lock.

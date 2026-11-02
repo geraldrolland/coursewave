@@ -84,14 +84,6 @@ class Notification(SQLModel, table=True):
             default=NotificationStatus.PENDING,
         ),
     )
-    release_after: datetime = Field(
-        default_factory=utc_now,
-        sa_column=Column(
-            DateTime(timezone=True),
-            nullable=False,
-            index=True,
-        ),
-    )
     created_at: datetime = Field(
         default_factory=utc_now,
         sa_column=Column(

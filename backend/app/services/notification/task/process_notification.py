@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -14,14 +13,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.base_config import get_settings
-from app.base_utils import utc_now
 from app.db_config import create_postgresql_engine
 from app.redis_config import create_redis_client
 from app.services.notification.exception import NotificationError
 from app.services.notification.model import Notification, NotificationStatus
 from celery_app import celery_app
 
-logger = logging.getLogger("notification_service.tasks")
+logger = logging.getLogger("notification_service.task.process_notification")
 
 NOTIFICATION_LOCK_TTL_SECONDS = 120
 
@@ -64,11 +62,6 @@ async def _process_notification(
             if notification is None:
                 logger.warning("Notification %s does not exist", notification_id)
                 return
-
-            notification.release_after = utc_now() + timedelta(
-                seconds=NOTIFICATION_LOCK_TTL_SECONDS
-            )
-            await session.commit()
 
             if notification.status == NotificationStatus.PROCESSED:
                 logger.info("Notification %s is already processed", notification_id)

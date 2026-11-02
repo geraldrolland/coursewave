@@ -49,7 +49,8 @@ backend/
 │       ├── notification/
 │       │   ├── exception/
 │       │   ├── model/
-│       │   └── tasks.py
+│       │   └── task/
+│       │       └── process_notification.py
 │       └── student/
 │           ├── exception/
 │           ├── model/
@@ -385,7 +386,6 @@ Notifications are persisted in the `notification` table and delivered by the
 | `belongs_to` | `student`, `instructor`, `admin` | `NotificationAudience` |
 | `user_id` | UUID | Recipient identifier; indexed |
 | `status` | `pending`, `processed`, `failed` | Defaults to `pending` |
-| `release_after` | timezone-aware datetime | Earliest retry time; indexed |
 | `created_at`, `updated_at` | timezone-aware datetimes | Audit timestamps |
 
 `Notification.send()` is a synchronous placeholder and currently returns
@@ -399,7 +399,7 @@ without delivering anything. Real channel integrations should raise
 1. Acquires the Redis lock `notification:process:<id>` with a 120-second TTL.
 2. If the lock is held, retries with the same 120-second lock TTL as its
    countdown.
-3. Loads the notification and sets `release_after = now + 120 seconds`.
+3. Loads the notification.
 4. Returns if the status is already `processed`.
 5. Calls `notification.send()`.
 6. On success, marks the notification `processed`.
@@ -464,7 +464,8 @@ failure handling.
   until delivery channels are implemented.
 - There is no migration framework. Existing databases need the `notification`
   table created manually because `AUTO_CREATE_TABLES` only creates missing
-  tables on a fresh database.
+  tables on a fresh database. If an earlier schema exists, drop the unused
+  `release_after` column manually.
 
 ## License
 
