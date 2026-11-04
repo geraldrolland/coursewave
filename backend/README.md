@@ -18,6 +18,7 @@ directly.
 - `EMAIL` and `GOOGLE` authentication methods with nullable password hashes.
 - Asynchronous notification processing through Celery, RabbitMQ quorum queues,
   and Redis locks.
+- Jinja-rendered email templates for OTP and email verification messages.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -51,12 +52,20 @@ backend/
 │       │   ├── model/
 │       │   └── task/
 │       │       └── process_notification.py
-│       └── student/
-│           ├── exception/
-│           ├── model/
-│           ├── router/
-│           └── schema/
+│       ├── student/
+│       │   ├── exception/
+│       │   ├── model/
+│       │   ├── router/
+│       │   └── schema/
+│       └── template_manager/
+│           └── __init__.py
 ├── celery_app.py
+├── templates/
+│   └── email/
+│       ├── email_verification/
+│       │   └── v1.html
+│       └── otp/
+│           └── v1.html
 ├── tests/
 ├── .env.example
 ├── requirements.txt
@@ -373,6 +382,47 @@ Errors:
 If the database transaction fails after the Redis token is written, the token is
 deleted on a best-effort basis.
 
+## Email Templates
+
+`app.services.template_manager` renders the email bodies used by the notification
+service:
+
+```python
+from app.services.template_manager import TemplateManager
+
+message = TemplateManager(
+    "email_verification",
+    {"link": "https://app.example.com/verify?token=abc"},
+).get_template()
+
+message.subject
+message.body
+```
+
+`TemplateManager` accepts either the string values `otp` and
+`email_verification` or their `TemplateType` enum members. `get_template()`
+returns a frozen `template` dataclass with `subject` and rendered `body` fields.
+
+Templates are registered in `template_registery`:
+
+```python
+template_registery = {
+    TemplateType.EMAIL_VERIFICATION: {
+        "subject": "Verify your CourseWave email",
+        "template_dir": "templates/email/email_verification",
+        "template": "v1.html",
+    },
+}
+```
+
+`template_dir` contains the versioned HTML files, and `template` pins the version
+used by `get_template()`. Add `v2.html` beside `v1.html` and update the registry
+entry to switch versions. Template paths are resolved relative to `backend/`.
+
+The email verification template renders `{{ link }}` as the `href` value.
+The OTP template renders `{{ otp }}` in its message body. `template_build()`
+is the static Jinja rendering helper used by `get_template()`.
+
 ## Notifications
 
 Notifications are persisted in the `notification` table and delivered by the
@@ -451,8 +501,8 @@ The suite covers authentication, CORS, caching, rate limiting, refresh-token
 rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
 duplicate-email handling, student auth-method defaults, notification model
-defaults, Celery queue topology, lock handling, retry behavior, and final
-failure handling.
+defaults, Celery queue topology, lock handling, retry behavior, final failure
+handling, and email template rendering.
 
 ## Known Limitations
 

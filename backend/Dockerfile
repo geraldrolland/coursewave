@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY templates ./templates
 COPY celery_app.py ./
 
 RUN useradd --create-home --uid 10001 appuser

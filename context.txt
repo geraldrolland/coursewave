@@ -11,6 +11,7 @@ requested refinements:
 - Removal of the transactional outbox model.
 - A notification model and Celery task backed by RabbitMQ queues, Redis locks,
   retries, and a dead-letter queue.
+- A typed Jinja email template manager for OTP and email verification messages.
 - The backend is the public API; api_gateway/ has been deleted.
 - RabbitMQ replaces Kafka.
 - No Docker containers are started during development/validation.
@@ -125,6 +126,25 @@ Notifications and Celery
   added to docker-compose.yml. It waits for Redis, PostgreSQL, and RabbitMQ to
   become healthy.
 
+Email Templates
+- New service at backend/app/services/template_manager/__init__.py.
+- TemplateType is a str enum with OTP = "otp" and
+  EMAIL_VERIFICATION = "email_verification".
+- TemplateManager(type, content) normalizes either a string or TemplateType.
+- get_template() uses template_registery to select a subject, template
+  directory, and pinned template version, then returns a frozen `template`
+  dataclass with subject and rendered body fields.
+- template_build(template_path, content) is a static Jinja2 helper. Relative
+  paths resolve from backend/.
+- Registered templates:
+    otp -> templates/email/otp/v1.html with content key `otp`
+    email_verification -> templates/email/email_verification/v1.html with
+                         content key `link`
+- The template directory holds versioned files. The registry `template` value
+  pins the active version; v2.html can be added and selected by changing the
+  registry entry.
+- Jinja2 was added to requirements.txt, and the Dockerfile copies templates/.
+
 Prior decisions that remain in place
 - Student registration remains public and unchanged.
 - Student.auth_method is an AuthMethod enum with EMAIL = "email" and
@@ -177,6 +197,8 @@ Completed
 - Added the worker service and a shared backend environment anchor to
   docker-compose.yml.
 - Added FakeLock/FakeRedis.lock and backend/tests/test_notification.py.
+- Added the template_manager service, OTP and email verification templates,
+  Jinja2 dependency, Docker template copy, and template tests.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -186,7 +208,7 @@ Blocked
 - None.
 
 Next Move
-- None. The notification/Celery implementation is complete and validated.
+- None. The template manager implementation is complete and validated.
 
 
 Known Gaps
@@ -204,10 +226,12 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 122 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 129 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
+- TemplateManager rendered the verification link and returned the frozen template
+  dataclass.
 - Celery import prints: notification.process_notification and task.
 - Queue inspection prints:
     task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
@@ -257,6 +281,15 @@ Relevant Files
   process_notification task, lock flow, retry handling, and final Reject.
 - backend/app/services/notification/task/__init__.py
   Exports the process_notification task.
+- backend/app/services/template_manager/__init__.py
+  TemplateType, template dataclass, template_registery, TemplateManager, and
+  template_build.
+- backend/templates/email/otp/v1.html
+  OTP email body rendered with the `otp` content key.
+- backend/templates/email/email_verification/v1.html
+  Email verification body rendered with the `link` content key.
+- backend/tests/test_template_manager.py
+  Registry, enum/string input, rendering, frozen dataclass, and error tests.
 - backend/celery_app.py
   Celery app, queue/DLX/DLQ declarations, retry and ack settings, task route,
   and the worker_init queue declaration.
@@ -265,9 +298,10 @@ Relevant Files
 - backend/tests/test_notification.py
   Model, queue topology, worker declaration, lock, retry, and failure tests.
 - backend/requirements.txt
-  FastAPI, Celery, SQLModel, Redis, asyncpg, and auth dependencies.
+  FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, and auth dependencies.
 - backend/Dockerfile
-  Installs requirements, copies app and celery_app.py, and runs uvicorn.
+  Installs requirements, copies app, templates, and celery_app.py, and runs
+  uvicorn.
 - docker-compose.yml
   coursewave, worker, postgres, redis, and rabbitmq; shared backend environment.
 - backend/README.md and README.md
@@ -298,6 +332,9 @@ Important Context
 - Notification process lock key: notification:process:<id>, with a 120-second
   TTL. A busy lock retries after the same 120-second TTL. There is no commit
   lock.
+- TemplateManager accepts `otp` or `email_verification` as either a string or
+  TemplateType. Email verification templates use the `link` content key; OTP
+  templates use `otp`.
 - Retry countdowns use retry_backoff=10 with full jitter, so the nominal delays
   are 10, 20, 40, 80, and 160 seconds, capped at 600 seconds.
 - Celery self.retry publishes a new message, so RabbitMQ x-delivery-limit=5
