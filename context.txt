@@ -127,7 +127,8 @@ Notifications and Celery
   become healthy.
 
 Email Templates
-- New service at backend/app/services/template_manager/__init__.py.
+- New service at
+  backend/app/services/notification/template_manager/__init__.py.
 - TemplateType is a str enum with OTP = "otp" and
   EMAIL_VERIFICATION = "email_verification".
 - TemplateManager(type, content) normalizes either a string or TemplateType.
@@ -197,8 +198,11 @@ Completed
 - Added the worker service and a shared backend environment anchor to
   docker-compose.yml.
 - Added FakeLock/FakeRedis.lock and backend/tests/test_notification.py.
-- Added the template_manager service, OTP and email verification templates,
-  Jinja2 dependency, Docker template copy, and template tests.
+- Added the template_manager under the notification service, OTP and email
+  verification templates, Jinja2 dependency, Docker template copy, and template
+  tests.
+- Moved template_manager from services/ to services/notification/ and updated
+  imports, backend path resolution, and documentation.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -281,7 +285,7 @@ Relevant Files
   process_notification task, lock flow, retry handling, and final Reject.
 - backend/app/services/notification/task/__init__.py
   Exports the process_notification task.
-- backend/app/services/template_manager/__init__.py
+- backend/app/services/notification/template_manager/__init__.py
   TemplateType, template dataclass, template_registery, TemplateManager, and
   template_build.
 - backend/templates/email/otp/v1.html

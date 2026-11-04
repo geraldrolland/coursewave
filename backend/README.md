@@ -50,15 +50,15 @@ backend/
 │       ├── notification/
 │       │   ├── exception/
 │       │   ├── model/
-│       │   └── task/
-│       │       └── process_notification.py
-│       ├── student/
-│       │   ├── exception/
-│       │   ├── model/
-│       │   ├── router/
-│       │   └── schema/
-│       └── template_manager/
-│           └── __init__.py
+│       │   ├── task/
+│       │   │   └── process_notification.py
+│       │   └── template_manager/
+│       │       └── __init__.py
+│       └── student/
+│           ├── exception/
+│           ├── model/
+│           ├── router/
+│           └── schema/
 ├── celery_app.py
 ├── templates/
 │   └── email/
@@ -384,11 +384,11 @@ deleted on a best-effort basis.
 
 ## Email Templates
 
-`app.services.template_manager` renders the email bodies used by the notification
-service:
+`app.services.notification.template_manager` renders the email bodies used by the
+notification service:
 
 ```python
-from app.services.template_manager import TemplateManager
+from app.services.notification.template_manager import TemplateManager
 
 message = TemplateManager(
     "email_verification",

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services.template_manager import (
+from app.services.notification.template_manager import (
     TemplateManager,
     TemplateType,
     template,
