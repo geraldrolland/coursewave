@@ -4,6 +4,7 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from redis import Redis as SyncRedis
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
@@ -13,6 +14,7 @@ from app.services.notification.exception import (
     ProviderServiceNotAvailableError,
 )
 from app.services.notification.provider.base import BaseProvider
+from app.services.notification.provider.cache_mixin import NotificationCacheMixin
 from app.services.notification.template_manager import TemplateManager
 
 if TYPE_CHECKING:
@@ -26,7 +28,7 @@ EMAIL_SUBJECT_REGISTRY = {
 }
 
 
-class EmailProvider(BaseProvider):
+class EmailProvider(NotificationCacheMixin, BaseProvider):
     """Deliver email notifications through SendGrid."""
 
     def __init__(
@@ -34,14 +36,23 @@ class EmailProvider(BaseProvider):
         api_key: str | None = None,
         from_email: str | None = None,
         from_name: str | None = None,
+        redis_client: SyncRedis | None = None,
     ) -> None:
         settings = get_settings()
         self.api_key = api_key or settings.sendgrid_api_key
         self.from_email = from_email or settings.sendgrid_from_email
         self.from_name = from_name or settings.sendgrid_from_name
+        self._redis_client = redis_client
 
     def process(self, notification: "Notification") -> None:
         """Render the email template and send it through SendGrid."""
+
+        if self.is_notification_cached(notification):
+            logger.info(
+                "Notification %s was already processed",
+                notification.notification_id,
+            )
+            return
 
         try:
             payload = notification.payload
@@ -106,6 +117,7 @@ class EmailProvider(BaseProvider):
                 f"Email provider service returned status {status_code}"
             )
 
+        self.cache_notification(notification)
         logger.info(
             "Email notification %s sent with template %s",
             notification.notification_id,

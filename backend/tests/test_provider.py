@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from redis.exceptions import RedisError
 
 from app.services.notification.exception import (
     ProviderError,
@@ -18,11 +19,42 @@ from app.services.notification.model import (
 )
 from app.services.notification.provider import ProviderManager, ProviderType
 from app.services.notification.provider.base import BaseProvider
+from app.services.notification.provider.cache_mixin import (
+    PROCESSED_NOTIFICATION_TTL_SECONDS,
+    PROCESSED_NOTIFICATION_VALUE,
+)
 from app.services.notification.provider.email_provider import (
     EMAIL_SUBJECT_REGISTRY,
     EmailProvider,
 )
 from app.services.notification.provider.provider_registery import provider_registery
+
+
+class FakeSyncRedis:
+    """Minimal synchronous Redis double for notification cache tests."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.ttls: dict[str, int | None] = {}
+        self.fail_exists = False
+        self.fail_set = False
+
+    def exists(self, key: str) -> int:
+        if self.fail_exists:
+            raise RedisError("Redis read failed")
+        return int(key in self.values)
+
+    def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+    ) -> bool:
+        if self.fail_set:
+            raise RedisError("Redis write failed")
+        self.values[key] = value
+        self.ttls[key] = ex
+        return True
 
 
 def make_notification(payload: dict) -> Notification:
@@ -33,6 +65,15 @@ def make_notification(payload: dict) -> Notification:
         payload=payload,
         belongs_to=NotificationAudience.STUDENT,
         user_id=uuid4(),
+    )
+
+
+def notification_cache_key(notification: Notification) -> str:
+    """Return the expected processed-notification cache key."""
+
+    return (
+        f"notification:processed:{notification.type.value}:"
+        f"{notification.notification_id}"
     )
 
 
@@ -89,10 +130,12 @@ def test_email_provider_sends_rendered_template(
         "app.services.notification.provider.email_provider.SendGridAPIClient",
         client_factory,
     )
+    redis = FakeSyncRedis()
     provider = EmailProvider(
         api_key="test-key",
         from_email="sender@example.com",
         from_name="CourseWave",
+        redis_client=redis,
     )
     notification = make_notification(
         {
@@ -108,6 +151,10 @@ def test_email_provider_sends_rendered_template(
     assert clients[0].api_key == "test-key"
     assert len(clients[0].messages) == 1
 
+    cache_key = notification_cache_key(notification)
+    assert redis.values[cache_key] == PROCESSED_NOTIFICATION_VALUE
+    assert redis.ttls[cache_key] == PROCESSED_NOTIFICATION_TTL_SECONDS
+
     message = clients[0].messages[0].get()
     assert message["from"] == {
         "name": "CourseWave",
@@ -122,6 +169,57 @@ def test_email_provider_sends_rendered_template(
         '<a href="https://example.com/verify?token=abc">Verify email</a>'
         in message["content"][0]["value"]
     )
+
+
+def test_notification_cache_stores_processed_marker() -> None:
+    redis = FakeSyncRedis()
+    provider = EmailProvider(api_key="test-key", redis_client=redis)
+    notification = make_notification({})
+    cache_key = notification_cache_key(notification)
+
+    assert provider.is_notification_cached(notification) is False
+
+    provider.cache_notification(notification)
+
+    assert provider.is_notification_cached(notification) is True
+    assert redis.values[cache_key] == PROCESSED_NOTIFICATION_VALUE
+    assert redis.ttls[cache_key] == PROCESSED_NOTIFICATION_TTL_SECONDS
+
+
+def test_email_provider_skips_cached_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis = FakeSyncRedis()
+    notification = make_notification({})
+    redis.values[notification_cache_key(notification)] = (
+        PROCESSED_NOTIFICATION_VALUE
+    )
+
+    class UnexpectedSendGridClient:
+        def __init__(self, api_key: str) -> None:
+            self.api_key = api_key
+
+        def send(self, message) -> None:
+            pytest.fail("SendGrid must not be called for a cached notification")
+
+    monkeypatch.setattr(
+        "app.services.notification.provider.email_provider.SendGridAPIClient",
+        UnexpectedSendGridClient,
+    )
+    provider = EmailProvider(api_key="test-key", redis_client=redis)
+
+    provider.process(notification)
+
+
+def test_notification_cache_fails_open() -> None:
+    redis = FakeSyncRedis()
+    redis.fail_exists = True
+    redis.fail_set = True
+    provider = EmailProvider(api_key="test-key", redis_client=redis)
+    notification = make_notification({})
+
+    assert provider.is_notification_cached(notification) is False
+    provider.cache_notification(notification)
 
 
 def test_email_provider_accepts_email_recipient_and_json_content(
@@ -141,7 +239,10 @@ def test_email_provider_accepts_email_recipient_and_json_content(
         "app.services.notification.provider.email_provider.SendGridAPIClient",
         FakeSendGridClient,
     )
-    provider = EmailProvider(api_key="test-key")
+    provider = EmailProvider(
+        api_key="test-key",
+        redis_client=FakeSyncRedis(),
+    )
     notification = make_notification(
         {
             "template_type": "otp",
@@ -171,7 +272,11 @@ def test_email_provider_wraps_sendgrid_errors(
         "app.services.notification.provider.email_provider.SendGridAPIClient",
         FailingSendGridClient,
     )
-    provider = EmailProvider(api_key="test-key")
+    redis = FakeSyncRedis()
+    provider = EmailProvider(
+        api_key="test-key",
+        redis_client=redis,
+    )
     notification = make_notification(
         {
             "template_type": "email_verification",
@@ -184,6 +289,7 @@ def test_email_provider_wraps_sendgrid_errors(
         provider.process(notification)
 
     assert isinstance(error.value.__cause__, RuntimeError)
+    assert redis.values == {}
 
 
 def test_email_provider_rejects_non_success_response(
@@ -200,7 +306,11 @@ def test_email_provider_rejects_non_success_response(
         "app.services.notification.provider.email_provider.SendGridAPIClient",
         BadStatusClient,
     )
-    provider = EmailProvider(api_key="test-key")
+    redis = FakeSyncRedis()
+    provider = EmailProvider(
+        api_key="test-key",
+        redis_client=redis,
+    )
     notification = make_notification(
         {
             "template_type": "email_verification",
@@ -214,6 +324,8 @@ def test_email_provider_rejects_non_success_response(
         match="status 400",
     ):
         provider.process(notification)
+
+    assert redis.values == {}
 
 
 def test_email_provider_rejects_invalid_sendgrid_response(
@@ -230,7 +342,10 @@ def test_email_provider_rejects_invalid_sendgrid_response(
         "app.services.notification.provider.email_provider.SendGridAPIClient",
         InvalidResponseClient,
     )
-    provider = EmailProvider(api_key="test-key")
+    provider = EmailProvider(
+        api_key="test-key",
+        redis_client=FakeSyncRedis(),
+    )
     notification = make_notification(
         {
             "template_type": "email_verification",
@@ -253,7 +368,10 @@ def test_email_provider_wraps_processing_errors(
         "app.services.notification.provider.email_provider.TemplateManager.get_template",
         fail_to_render,
     )
-    provider = EmailProvider(api_key="test-key")
+    provider = EmailProvider(
+        api_key="test-key",
+        redis_client=FakeSyncRedis(),
+    )
     notification = make_notification(
         {
             "template_type": "email_verification",
@@ -269,7 +387,10 @@ def test_email_provider_wraps_processing_errors(
 
 
 def test_email_provider_requires_a_recipient() -> None:
-    provider = EmailProvider(api_key="test-key")
+    provider = EmailProvider(
+        api_key="test-key",
+        redis_client=FakeSyncRedis(),
+    )
     notification = make_notification(
         {
             "template_type": "email_verification",

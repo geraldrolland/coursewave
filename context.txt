@@ -170,6 +170,13 @@ Notification Providers
   recognizes them.
 - SendGrid settings use SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, and
   SENDGRID_FROM_NAME, with placeholder defaults.
+- NotificationCacheMixin uses synchronous Redis via
+  create_sync_redis_client(settings).
+- Processed-notification key format:
+  notification:processed:<notification type>:<notification id>.
+- The cached value is "processed" with a 240-second TTL. EmailProvider checks
+  the key before processing and writes it only after a successful SendGrid send.
+- Redis cache read/write failures fail open and log a warning.
 
 Prior decisions that remain in place
 - Student registration remains public and unchanged.
@@ -234,6 +241,8 @@ Completed
 - Updated EmailProvider to wrap processing failures in ProviderError and
   SendGrid failures in ProviderServiceNotAvailableError, with the requested
   spelling alias.
+- Added NotificationCacheMixin and a synchronous Redis client factory, then
+  integrated processed-notification cache checks and writes into EmailProvider.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -261,12 +270,14 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 144 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 147 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
 - TemplateManager renders metadata version_number=1 and relative template_path;
   ProviderManager resolves EMAIL to EmailProvider/BaseProvider.
+- Processed-notification cache stores value=processed with a 240-second TTL,
+  skips cached notifications, and fails open on Redis errors.
 - Celery import prints: notification.process_notification and task.
 - Queue inspection prints:
     task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
@@ -287,6 +298,8 @@ Relevant Files
   split_csv helper.
 - backend/app/base_utils/__init__.py
   Shared utc_now helper used by the student and notification models.
+- backend/app/redis_config/__init__.py
+  Async and synchronous Redis client factories built from Settings.
 - backend/app/main.py
   create_app, lifespan, Redis provider, route registration, middleware order,
   and Notification import for table creation.
@@ -320,9 +333,13 @@ Relevant Files
   ProviderManager and ProviderType exports.
 - backend/app/services/notification/provider/base.py
   BaseProvider with abstract process(notification).
+- backend/app/services/notification/provider/cache_mixin.py
+  NotificationCacheMixin, processed-notification key builder, 240-second Redis
+  cache, and fail-open Redis error handling.
 - backend/app/services/notification/provider/email_provider.py
   SendGrid EmailProvider, payload parsing, template rendering, subject lookup,
-  ProviderError wrapping, and ProviderServiceNotAvailableError conversion.
+  cache checks/writes, ProviderError wrapping, and
+  ProviderServiceNotAvailableError conversion.
 - backend/app/services/notification/provider/provider_registery.py
   ProviderType enum, email_provider instance, and {"email": email_provider}
   registry.
@@ -396,6 +413,9 @@ Important Context
 - EmailProvider raises ProviderError for payload/rendering/message-building
   failures and ProviderServiceNotAvailableError for SendGrid client or non-2xx
   response failures.
+- Processed notification cache key:
+  notification:processed:<type>:<notification_id>; value "processed"; TTL 240
+  seconds. Cache errors fail open.
 - Retry countdowns use retry_backoff=10 with full jitter, so the nominal delays
   are 10, 20, 40, 80, and 160 seconds, capped at 600 seconds.
 - Celery self.retry publishes a new message, so RabbitMQ x-delivery-limit=5

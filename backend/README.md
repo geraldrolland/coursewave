@@ -20,6 +20,7 @@ directly.
   and Redis locks.
 - Jinja-rendered email templates for OTP and email verification messages.
 - SendGrid-backed notification email delivery through a provider registry.
+- A four-minute Redis cache that skips already-processed notifications.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -54,6 +55,7 @@ backend/
 │       │   ├── provider/
 │       │   │   ├── __init__.py
 │       │   │   ├── base.py
+│       │   │   ├── cache_mixin.py
 │       │   │   ├── email_provider.py
 │       │   │   └── provider_registery.py
 │       │   ├── task/
@@ -473,6 +475,17 @@ SendGrid client and non-2xx response errors raise
 `ProviderServiceNotAvailbleError` spelling). Both are subclasses of
 `NotificationError` so the existing Celery retry flow handles them.
 
+`EmailProvider` also inherits `NotificationCacheMixin`. Before processing, it
+checks Redis for:
+
+```text
+notification:processed:<notification-type>:<notification-id>
+```
+
+A cached key causes the provider to return without sending again. After a
+successful send, the key is stored with the value `processed` and a 240-second
+TTL. Redis read and write failures fail open so email delivery is not blocked.
+
 `Notification.send()` is not wired to the provider manager yet.
 
 ## Notifications
@@ -554,8 +567,8 @@ rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
 duplicate-email handling, student auth-method defaults, notification model
 defaults, Celery queue topology, lock handling, retry behavior, final failure
-handling, email template rendering, provider lookup, and SendGrid error
-handling.
+handling, email template rendering, provider lookup, SendGrid error handling,
+and processed-notification caching.
 
 ## Known Limitations
 
