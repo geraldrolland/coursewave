@@ -6,8 +6,10 @@ from uuid import uuid4
 import pytest
 
 from app.services.notification.exception import (
-    ProviderNotAvailableError,
+    ProviderError,
     ProviderNotFoundError,
+    ProviderServiceNotAvailbleError,
+    ProviderServiceNotAvailableError,
 )
 from app.services.notification.model import (
     Notification,
@@ -47,6 +49,10 @@ def test_provider_manager_returns_registered_email_provider() -> None:
     assert manager.get_provider("email") is provider_registery["email"]
     assert manager.get_provider(ProviderType.EMAIL) is provider_registery["email"]
     assert ProviderManager.get_provider("email") is provider_registery["email"]
+
+
+def test_provider_service_error_spelling_alias() -> None:
+    assert ProviderServiceNotAvailbleError is ProviderServiceNotAvailableError
 
 
 @pytest.mark.parametrize(
@@ -174,7 +180,7 @@ def test_email_provider_wraps_sendgrid_errors(
         }
     )
 
-    with pytest.raises(ProviderNotAvailableError) as error:
+    with pytest.raises(ProviderServiceNotAvailableError) as error:
         provider.process(notification)
 
     assert isinstance(error.value.__cause__, RuntimeError)
@@ -203,8 +209,63 @@ def test_email_provider_rejects_non_success_response(
         }
     )
 
-    with pytest.raises(ProviderNotAvailableError, match="status 400"):
+    with pytest.raises(
+        ProviderServiceNotAvailableError,
+        match="status 400",
+    ):
         provider.process(notification)
+
+
+def test_email_provider_rejects_invalid_sendgrid_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidResponseClient:
+        def __init__(self, api_key: str) -> None:
+            self.api_key = api_key
+
+        def send(self, message):
+            return SimpleNamespace()
+
+    monkeypatch.setattr(
+        "app.services.notification.provider.email_provider.SendGridAPIClient",
+        InvalidResponseClient,
+    )
+    provider = EmailProvider(api_key="test-key")
+    notification = make_notification(
+        {
+            "template_type": "email_verification",
+            "content": {"link": "https://example.com/verify"},
+            "to_email": "student@example.com",
+        }
+    )
+
+    with pytest.raises(ProviderServiceNotAvailableError, match="invalid response"):
+        provider.process(notification)
+
+
+def test_email_provider_wraps_processing_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_to_render(*args, **kwargs) -> None:
+        raise RuntimeError("template rendering failed")
+
+    monkeypatch.setattr(
+        "app.services.notification.provider.email_provider.TemplateManager.get_template",
+        fail_to_render,
+    )
+    provider = EmailProvider(api_key="test-key")
+    notification = make_notification(
+        {
+            "template_type": "email_verification",
+            "content": {"link": "https://example.com/verify"},
+            "to_email": "student@example.com",
+        }
+    )
+
+    with pytest.raises(ProviderError) as error:
+        provider.process(notification)
+
+    assert isinstance(error.value.__cause__, RuntimeError)
 
 
 def test_email_provider_requires_a_recipient() -> None:
@@ -216,5 +277,5 @@ def test_email_provider_requires_a_recipient() -> None:
         }
     )
 
-    with pytest.raises(ProviderNotAvailableError, match="recipient"):
+    with pytest.raises(ProviderError, match="recipient"):
         provider.process(notification)

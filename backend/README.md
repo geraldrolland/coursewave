@@ -466,9 +466,12 @@ Providers implement `BaseProvider.process(notification)`. The built-in
 may be a JSON object or a JSON string.
 
 `EMAIL_SUBJECT_REGISTRY` maps template types to email subjects. SendGrid uses
-`SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, and `SENDGRID_FROM_NAME`. A delivery
-or HTTP error raises `ProviderNotAvailableError`, which subclasses
-`NotificationError` so the existing Celery retry flow handles it.
+`SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, and `SENDGRID_FROM_NAME`. Errors while
+processing the payload, rendering, or building the message raise `ProviderError`.
+SendGrid client and non-2xx response errors raise
+`ProviderServiceNotAvailableError` (also exported with the
+`ProviderServiceNotAvailbleError` spelling). Both are subclasses of
+`NotificationError` so the existing Celery retry flow handles them.
 
 `Notification.send()` is not wired to the provider manager yet.
 

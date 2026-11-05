@@ -18,7 +18,15 @@ class ProviderNotFoundError(ProviderError):
 
 
 class ProviderNotAvailableError(ProviderError):
-    """Raised when a notification provider cannot deliver a message."""
+    """Base exception for notification provider availability failures."""
+
+
+class ProviderServiceNotAvailableError(ProviderNotAvailableError):
+    """Raised when a provider service such as SendGrid cannot be reached."""
+
+
+# Preserve the spelling used in the provider contract.
+ProviderServiceNotAvailbleError = ProviderServiceNotAvailableError
 
 
 __all__ = [
@@ -27,4 +35,6 @@ __all__ = [
     "ProviderError",
     "ProviderNotAvailableError",
     "ProviderNotFoundError",
+    "ProviderServiceNotAvailbleError",
+    "ProviderServiceNotAvailableError",
 ]

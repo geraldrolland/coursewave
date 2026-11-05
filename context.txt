@@ -163,9 +163,11 @@ Notification Providers
 - EMAIL_SUBJECT_REGISTRY contains "email_verification" -> "verify your email"
   and "otp" -> "your verification code".
 - EmailProvider renders with TemplateManager and sends a SendGrid Mail object.
-  SendGrid/API errors or non-2xx responses raise ProviderNotAvailableError.
-- ProviderNotFoundError and ProviderNotAvailableError subclass NotificationError
-  via ProviderError, so the existing Celery retry flow recognizes them.
+  Logic errors raise ProviderError. SendGrid client and non-2xx response errors
+  raise ProviderServiceNotAvailableError (alias ProviderServiceNotAvailbleError).
+- ProviderNotFoundError and ProviderServiceNotAvailableError subclass
+  NotificationError via ProviderError, so the existing Celery retry flow
+  recognizes them.
 - SendGrid settings use SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, and
   SENDGRID_FROM_NAME, with placeholder defaults.
 
@@ -229,6 +231,9 @@ Completed
 - Removed template-manager subjects, added rendered template metadata, and added
   the notification provider package with ProviderManager, BaseProvider,
   EmailProvider, SendGrid settings, and provider tests.
+- Updated EmailProvider to wrap processing failures in ProviderError and
+  SendGrid failures in ProviderServiceNotAvailableError, with the requested
+  spelling alias.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -256,7 +261,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 141 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 144 passed (one Starlette/httpx deprecation warning).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -308,14 +313,16 @@ Relevant Files
   timestamps, and the send() placeholder.
 - backend/app/services/notification/exception/__init__.py
   NotificationServiceError, NotificationError, ProviderError,
-  ProviderNotFoundError, and ProviderNotAvailableError.
+  ProviderNotFoundError, ProviderNotAvailableError,
+  ProviderServiceNotAvailableError, and the ProviderServiceNotAvailbleError
+  spelling alias.
 - backend/app/services/notification/provider/__init__.py
   ProviderManager and ProviderType exports.
 - backend/app/services/notification/provider/base.py
   BaseProvider with abstract process(notification).
 - backend/app/services/notification/provider/email_provider.py
   SendGrid EmailProvider, payload parsing, template rendering, subject lookup,
-  and ProviderNotAvailableError wrapping.
+  ProviderError wrapping, and ProviderServiceNotAvailableError conversion.
 - backend/app/services/notification/provider/provider_registery.py
   ProviderType enum, email_provider instance, and {"email": email_provider}
   registry.
@@ -386,6 +393,9 @@ Important Context
   template_path; subjects are provider-owned.
 - ProviderManager only has an `email` provider registered. Email notifications
   expect payload keys template_type, content, and to_email (email fallback).
+- EmailProvider raises ProviderError for payload/rendering/message-building
+  failures and ProviderServiceNotAvailableError for SendGrid client or non-2xx
+  response failures.
 - Retry countdowns use retry_backoff=10 with full jitter, so the nominal delays
   are 10, 20, 40, 80, and 160 seconds, capped at 600 seconds.
 - Celery self.retry publishes a new message, so RabbitMQ x-delivery-limit=5

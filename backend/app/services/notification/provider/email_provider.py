@@ -8,7 +8,10 @@ from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
 from app.base_config import get_settings
-from app.services.notification.exception import ProviderNotAvailableError
+from app.services.notification.exception import (
+    ProviderError,
+    ProviderServiceNotAvailableError,
+)
 from app.services.notification.provider.base import BaseProvider
 from app.services.notification.template_manager import TemplateManager
 
@@ -40,37 +43,37 @@ class EmailProvider(BaseProvider):
     def process(self, notification: "Notification") -> None:
         """Render the email template and send it through SendGrid."""
 
-        payload = notification.payload
         try:
-            template_type = payload["template_type"]
-            content = payload["content"]
-            recipient = payload.get("to_email") or payload.get("email")
-        except (AttributeError, KeyError, TypeError) as exc:
-            raise ProviderNotAvailableError(
-                "Email notification payload is invalid"
-            ) from exc
-
-        if not recipient:
-            raise ProviderNotAvailableError("Email recipient is missing")
-
-        subject = EMAIL_SUBJECT_REGISTRY.get(template_type)
-        if subject is None:
-            raise ProviderNotAvailableError(
-                f"No email subject is registered for {template_type}"
-            )
-
-        if isinstance(content, str):
+            payload = notification.payload
             try:
-                content = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise ProviderNotAvailableError(
-                    "Email notification content is invalid"
+                template_type = payload["template_type"]
+                content = payload["content"]
+                recipient = payload.get("to_email") or payload.get("email")
+            except (AttributeError, KeyError, TypeError) as exc:
+                raise ProviderError(
+                    "Email notification payload is invalid"
                 ) from exc
 
-        if not isinstance(content, dict):
-            raise ProviderNotAvailableError("Email notification content is invalid")
+            if not recipient:
+                raise ProviderError("Email recipient is missing")
 
-        try:
+            subject = EMAIL_SUBJECT_REGISTRY.get(template_type)
+            if subject is None:
+                raise ProviderError(
+                    f"No email subject is registered for {template_type}"
+                )
+
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except json.JSONDecodeError as exc:
+                    raise ProviderError(
+                        "Email notification content is invalid"
+                    ) from exc
+
+            if not isinstance(content, dict):
+                raise ProviderError("Email notification content is invalid")
+
             rendered = TemplateManager(template_type, content).get_template()
             message = Mail(
                 from_email=(self.from_email, self.from_name),
@@ -78,14 +81,29 @@ class EmailProvider(BaseProvider):
                 subject=subject,
                 html_content=rendered.body,
             )
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError("Email notification processing failed") from exc
+
+        try:
             response = SendGridAPIClient(self.api_key).send(message)
         except Exception as exc:
-            raise ProviderNotAvailableError("Email provider is unavailable") from exc
+            raise ProviderServiceNotAvailableError(
+                "Email provider service is unavailable"
+            ) from exc
 
-        status_code = response.status_code
-        if not 200 <= status_code < 300:
-            raise ProviderNotAvailableError(
-                f"Email provider returned status {status_code}"
+        try:
+            status_code = response.status_code
+            is_success = 200 <= status_code < 300
+        except (AttributeError, TypeError) as exc:
+            raise ProviderServiceNotAvailableError(
+                "Email provider service returned an invalid response"
+            ) from exc
+
+        if not is_success:
+            raise ProviderServiceNotAvailableError(
+                f"Email provider service returned status {status_code}"
             )
 
         logger.info(
