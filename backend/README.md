@@ -19,6 +19,7 @@ directly.
 - Asynchronous notification processing through Celery, RabbitMQ quorum queues,
   and Redis locks.
 - Jinja-rendered email templates for OTP and email verification messages.
+- SendGrid-backed notification email delivery through a provider registry.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -50,6 +51,11 @@ backend/
 │       ├── notification/
 │       │   ├── exception/
 │       │   ├── model/
+│       │   ├── provider/
+│       │   │   ├── __init__.py
+│       │   │   ├── base.py
+│       │   │   ├── email_provider.py
+│       │   │   └── provider_registery.py
 │       │   ├── task/
 │       │   │   └── process_notification.py
 │       │   └── template_manager/
@@ -120,6 +126,9 @@ Copy-Item .env.example .env
 | `AUTO_CREATE_TABLES` | Create missing SQLModel tables at startup | `false` |
 | `DATABASE_URL` | Optional SQLAlchemy database URL override | `postgresql+asyncpg://postgres:user123@localhost:5432/coursewave_db` |
 | `RABBITMQ_URL` | Broker URL used by the Celery worker | `amqp://guest:guest@localhost:5672/` |
+| `SENDGRID_API_KEY` | SendGrid API key used by the email provider | `SENDGRID_API_KEY_PLACEHOLDER` |
+| `SENDGRID_FROM_EMAIL` | Verified sender address used by the email provider | `no-reply@coursewave.example` |
+| `SENDGRID_FROM_NAME` | Sender display name used by the email provider | `CourseWave` |
 
 ### Run
 
@@ -384,31 +393,32 @@ deleted on a best-effort basis.
 
 ## Email Templates
 
-`app.services.notification.template_manager` renders the email bodies used by the
-notification service:
+`app.services.notification.template_manager` renders the email bodies used by
+notification providers:
 
 ```python
 from app.services.notification.template_manager import TemplateManager
 
-message = TemplateManager(
+rendered = TemplateManager(
     "email_verification",
     {"link": "https://app.example.com/verify?token=abc"},
 ).get_template()
 
-message.subject
-message.body
+rendered.body
+rendered.version_number
+rendered.template_path
 ```
 
 `TemplateManager` accepts either the string values `otp` and
 `email_verification` or their `TemplateType` enum members. `get_template()`
-returns a frozen `template` dataclass with `subject` and rendered `body` fields.
+returns a frozen `template` dataclass with `body`, `version_number`, and
+`template_path` fields.
 
 Templates are registered in `template_registery`:
 
 ```python
 template_registery = {
     TemplateType.EMAIL_VERIFICATION: {
-        "subject": "Verify your CourseWave email",
         "template_dir": "templates/email/email_verification",
         "template": "v1.html",
     },
@@ -416,12 +426,51 @@ template_registery = {
 ```
 
 `template_dir` contains the versioned HTML files, and `template` pins the version
-used by `get_template()`. Add `v2.html` beside `v1.html` and update the registry
-entry to switch versions. Template paths are resolved relative to `backend/`.
+used by `get_template()`. `version_number` is derived from the pinned filename,
+so `v1.html` returns `1`. Template paths are resolved relative to `backend/`.
 
 The email verification template renders `{{ link }}` as the `href` value.
-The OTP template renders `{{ otp }}` in its message body. `template_build()`
-is the static Jinja rendering helper used by `get_template()`.
+The OTP template renders `{{ otp }}` in its message body. `template_build()` is
+the static Jinja rendering helper used by `get_template()`.
+
+## Notification Providers
+
+`app.services.notification.provider` resolves the delivery implementation for a
+notification type:
+
+```python
+from app.services.notification.provider import ProviderManager
+
+provider = ProviderManager().get_provider("email")
+provider.process(notification)
+```
+
+`ProviderManager.get_provider()` accepts `email`, `push`, and `sms` strings or
+their `ProviderType` enum members. Only `email` is registered. Looking up an
+unregistered or unknown type raises `ProviderNotFoundError`.
+
+Providers implement `BaseProvider.process(notification)`. The built-in
+`EmailProvider` uses SendGrid and expects this payload shape:
+
+```json
+{
+  "template_type": "email_verification",
+  "content": {
+    "link": "https://example.com/verify"
+  },
+  "to_email": "student@example.com"
+}
+```
+
+`to_email` is the preferred recipient key; `email` is also accepted. `content`
+may be a JSON object or a JSON string.
+
+`EMAIL_SUBJECT_REGISTRY` maps template types to email subjects. SendGrid uses
+`SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, and `SENDGRID_FROM_NAME`. A delivery
+or HTTP error raises `ProviderNotAvailableError`, which subclasses
+`NotificationError` so the existing Celery retry flow handles it.
+
+`Notification.send()` is not wired to the provider manager yet.
 
 ## Notifications
 
@@ -502,7 +551,8 @@ rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
 duplicate-email handling, student auth-method defaults, notification model
 defaults, Celery queue topology, lock handling, retry behavior, final failure
-handling, and email template rendering.
+handling, email template rendering, provider lookup, and SendGrid error
+handling.
 
 ## Known Limitations
 
@@ -510,8 +560,8 @@ handling, and email template rendering.
   refresh tokens must be issued by another service that creates the matching
   Redis session.
 - There is no notification enqueue endpoint or scheduler. Notification rows
-  must be created and submitted by another component, and `send()` is a no-op
-  until delivery channels are implemented.
+  must be created and submitted by another component, and `send()` remains a
+  no-op until it is wired to the provider manager.
 - There is no migration framework. Existing databases need the `notification`
   table created manually because `AUTO_CREATE_TABLES` only creates missing
   tables on a fresh database. If an earlier schema exists, drop the unused

@@ -21,18 +21,17 @@ class TemplateType(str, Enum):
 class template:
     """A rendered email template."""
 
-    subject: str
     body: str
+    version_number: int
+    template_path: str
 
 
 template_registery: dict[TemplateType, dict[str, str]] = {
     TemplateType.OTP: {
-        "subject": "Your CourseWave verification code",
         "template_dir": "templates/email/otp",
         "template": "v1.html",
     },
     TemplateType.EMAIL_VERIFICATION: {
-        "subject": "Verify your CourseWave email",
         "template_dir": "templates/email/email_verification",
         "template": "v1.html",
     },
@@ -72,12 +71,17 @@ class TemplateManager:
         return rendered
 
     def get_template(self) -> template:
-        """Return the registered subject and rendered HTML for this type."""
+        """Return the rendered HTML and metadata for this template type."""
 
         config = template_registery[self.type]
         template_path = Path(config["template_dir"]) / config["template"]
         body = self.template_build(template_path, self.content)
-        return template(subject=config["subject"], body=body)
+        version_number = int(template_path.stem.removeprefix("v"))
+        return template(
+            body=body,
+            version_number=version_number,
+            template_path=template_path.as_posix(),
+        )
 
 
 __all__ = [

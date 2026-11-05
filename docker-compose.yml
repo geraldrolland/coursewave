@@ -34,6 +34,10 @@ x-backend-environment: &backend-environment
 
   RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER:-coursewave}:${RABBITMQ_DEFAULT_PASSWORD:-coursewave}@rabbitmq:5672/"
 
+  SENDGRID_API_KEY: "${SENDGRID_API_KEY:-SENDGRID_API_KEY_PLACEHOLDER}"
+  SENDGRID_FROM_EMAIL: "${SENDGRID_FROM_EMAIL:-no-reply@coursewave.example}"
+  SENDGRID_FROM_NAME: "${SENDGRID_FROM_NAME:-CourseWave}"
+
 services:
   redis:
     image: redis:7-alpine

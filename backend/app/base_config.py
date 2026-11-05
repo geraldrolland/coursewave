@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     auto_create_tables: bool = False
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
 
+    sendgrid_api_key: str = "SENDGRID_API_KEY_PLACEHOLDER"
+    sendgrid_from_email: str = "no-reply@coursewave.example"
+    sendgrid_from_name: str = "CourseWave"
+
     jwt_secret: str = "change-me-in-production"
     cookie_secret: str = "change-me-in-production"
     access_token_expiry: str = "7m"

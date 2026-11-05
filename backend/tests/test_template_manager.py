@@ -19,7 +19,7 @@ def test_template_registry_covers_supported_types() -> None:
         TemplateType.EMAIL_VERIFICATION,
     }
     for config in template_registery.values():
-        assert set(config) == {"subject", "template_dir", "template"}
+        assert set(config) == {"template_dir", "template"}
 
 
 def test_get_template_renders_email_verification_link() -> None:
@@ -32,7 +32,10 @@ def test_get_template_renders_email_verification_link() -> None:
 
     assert is_dataclass(result)
     assert isinstance(result, template)
-    assert result.subject == "Verify your CourseWave email"
+    assert result.version_number == 1
+    assert result.template_path == (
+        "templates/email/email_verification/v1.html"
+    )
     assert (
         '<a href="https://example.com/verify?token=abc">Verify email</a>'
         in result.body
@@ -45,7 +48,8 @@ def test_get_template_accepts_enum_and_renders_otp() -> None:
 
     result = manager.get_template()
 
-    assert result.subject == "Your CourseWave verification code"
+    assert result.version_number == 1
+    assert result.template_path == "templates/email/otp/v1.html"
     assert "<strong>123456</strong>" in result.body
 
 
@@ -63,7 +67,7 @@ def test_template_is_frozen() -> None:
     result = TemplateManager("otp", {"otp": "123456"}).get_template()
 
     with pytest.raises(FrozenInstanceError):
-        result.subject = "Changed"
+        result.body = "Changed"
 
 
 def test_unknown_template_type_raises_value_error() -> None:

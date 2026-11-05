@@ -27,8 +27,8 @@ at `http://localhost:3000/docs` and requires a Bearer access token.
 
 See [`backend/README.md`](backend/README.md) for configuration, middleware
 behavior, the authentication and refresh-token contracts, the notification
-task flow and queue topology, email template rendering, and testing
-instructions.
+task flow and queue topology, email template rendering, notification providers,
+and testing instructions.
 
 ## Tests
 
