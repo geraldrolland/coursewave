@@ -1,7 +1,8 @@
 """FastAPI application for the CourseWave service."""
 
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
@@ -19,6 +20,8 @@ from app.middleware.refresh_token import RefreshTokenMiddleware
 from app.middleware.request_logger import RequestLoggerMiddleware
 from app.redis_config import create_redis_client
 from app.services.notification.model import Notification  # noqa: F401
+from app.services.notification.pub_sub.kafka import KafkaConsumer
+from app.services.notification.ws import router as notification_ws_router
 from app.services.student.model import Student  # noqa: F401
 from app.services.student.router.student import router as student_router
 
@@ -36,6 +39,16 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Initialize and release application resources."""
 
+        kafka_consumer: KafkaConsumer | None = None
+        kafka_task: asyncio.Task[None] | None = None
+        if settings.kafka_consumer_enabled:
+            kafka_consumer = KafkaConsumer(
+                topic=settings.notification_topic,
+                bootstrap_servers=settings.kafka_bootstrap_servers,
+                group_id=settings.kafka_consumer_group_id,
+            )
+            kafka_task = asyncio.create_task(kafka_consumer.run())
+
         try:
             if settings.auto_create_tables:
                 async with create_postgresql_engine().begin() as connection:
@@ -43,6 +56,13 @@ def create_app(
 
             yield
         finally:
+            if kafka_task is not None:
+                kafka_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await kafka_task
+            if kafka_consumer is not None:
+                await kafka_consumer.aclose()
+
             await app.state.redis.aclose()
             await create_postgresql_engine().dispose()
             create_postgresql_engine.cache_clear()
@@ -69,6 +89,7 @@ def create_app(
         return {"status": "ok"}
 
     app.include_router(student_router)
+    app.include_router(notification_ws_router)
 
     # add_middleware is LIFO: the last added middleware runs first.
     # Effective flow: CORS -> RequestLogger -> Auth -> RateLimit ->

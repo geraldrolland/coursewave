@@ -2,7 +2,8 @@
 
 CourseWave is a student platform built around a FastAPI backend, PostgreSQL,
 Redis, RabbitMQ, and a Celery worker for asynchronous notification delivery.
-Kafka is used for push notification fan-out through an external broker.
+Kafka is used for push notification fan-out and authenticated WebSocket
+delivery through an external broker.
 
 ## Services
 
@@ -29,7 +30,7 @@ at `http://localhost:3000/docs` and requires a Bearer access token.
 See [`backend/README.md`](backend/README.md) for configuration, middleware
 behavior, the authentication and refresh-token contracts, the notification
 task flow and queue topology, email template rendering, notification providers,
-and testing instructions.
+authenticated WebSocket notifications, and testing instructions.
 
 ## Tests
 

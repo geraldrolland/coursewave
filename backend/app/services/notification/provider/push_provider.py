@@ -13,7 +13,7 @@ from app.services.notification.exception import (
 )
 from app.services.notification.provider.base import BaseProvider
 from app.services.notification.provider.cache_mixin import NotificationCacheMixin
-from app.services.notification.pub_sub.kafka_producer import (
+from app.services.notification.pub_sub.kafka.kafka_producer import (
     KafkaProducer,
     kafka_producer,
 )

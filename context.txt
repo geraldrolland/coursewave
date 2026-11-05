@@ -14,6 +14,7 @@ requested refinements:
 - A typed Jinja email template manager for OTP and email verification messages,
   plus a notification provider registry with SendGrid email, Kafka push, and
   Termii SMS delivery.
+- Authenticated WebSocket notifications fed by a Kafka consumer.
 - The backend is the public API; api_gateway/ has been deleted.
 - RabbitMQ handles Celery tasks; Kafka handles push notification fan-out.
 - No Docker containers are started during development/validation.
@@ -175,7 +176,8 @@ Notification Providers
   SENDGRID_FROM_NAME, with placeholder defaults.
 - PushProvider inherits NotificationCacheMixin and BaseProvider. It publishes
   notification.payload to the Kafka notification_topic through the singleton
-  producer in backend/app/services/notification/pub_sub/kafka_producer.py.
+  producer in
+  backend/app/services/notification/pub_sub/kafka/kafka_producer.py.
 - Kafka settings use notification_topic (default "notification") and
   kafka_bootstrap_servers (default "localhost:9092").
 - The Kafka producer lazily creates a kafka-python KafkaProducer with a JSON
@@ -193,6 +195,27 @@ Notification Providers
   PushProvider, and SMSProvider check the key before processing and write it
   only after a successful send.
 - Redis cache read/write failures fail open and log a warning.
+
+WebSocket Notifications
+- New package at backend/app/services/notification/ws/.
+- WebSocket route: /notification?token=<access-token>.
+- authenticate_user decodes the access token, requires type=access, loads
+  session:<sessionId> from Redis, and stores the session in
+  websocket.state.user.
+- Close codes: 1008 for missing/invalid tokens, wrong token type, invalid
+  session ID, or missing session; 1011 for Redis or stored-session failures.
+- WebsocketNotificationManager keeps connections as
+  {user_id: list[WebSocket]}. register appends, remove deletes, and async send
+  only targets WebSocketState.CONNECTED sockets.
+- The endpoint registers the socket, sleeps in a loop, and removes the socket in
+  finally. WEBSOCKET_SLEEP_SECONDS is 30.
+- KafkaConsumer in pub_sub/kafka/kafka_consumer.py subscribes to
+  notification_topic, parses messages, reads recipient_id and message, calls the
+  WebSocket manager send, and commits offsets.
+- Consumer settings: kafka_consumer_enabled (default false) and
+  kafka_consumer_group_id (default coursewave-notification-websockets).
+- The FastAPI lifespan starts/stops KafkaConsumer when enabled. Kafka polling
+  and commits run on a dedicated single-thread executor.
 
 Prior decisions that remain in place
 - Student registration remains public and unchanged.
@@ -268,6 +291,11 @@ Completed
   producer/provider tests.
 - Extended NotificationCacheMixin to SMSProvider, including cache skips and
   successful-send writes.
+- Moved kafka_producer.py into pub_sub/kafka/ and added KafkaConsumer.
+- Added the ws package with /notification, authenticate_user,
+  WebsocketNotificationManager, and Kafka-to-WebSocket delivery.
+- Wired the WebSocket router and optional Kafka consumer lifecycle into the
+  FastAPI app.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -283,8 +311,11 @@ Next Move
 Known Gaps
 - No notification enqueue endpoint or scheduler exists; another component must
   insert Notification rows and submit the task.
-- Kafka is not included in docker-compose.yml; push delivery requires an
-  external broker configured by kafka_bootstrap_servers.
+- Kafka is not included in docker-compose.yml; push delivery and WebSocket
+  fan-out require an external broker configured by
+  kafka_bootstrap_servers.
+- KAFKA_CONSUMER_ENABLED defaults to false; set it to true to start the
+  Kafka-to-WebSocket consumer.
 - SendGrid, Termii, and Kafka defaults are placeholders that must be replaced.
 - No login/token-issuer endpoint exists; auth validates existing access tokens
   and refresh rotates existing sessions only.
@@ -296,7 +327,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 164 passed (Starlette/httpx and kafka-python deprecation warnings).
+- pytest -q: 180 passed (Starlette/httpx and kafka-python deprecation warnings).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -307,6 +338,10 @@ Validation Results
   skips cached notifications, and fails open on Redis errors.
 - KafkaProducer is a lazy singleton with JSON serialization and send futures;
   PushProvider and SMSProvider tests cover success and failure paths.
+- WebSocket endpoint tests cover valid sessions, all 1008/1011 close paths,
+  connection registration, and scope user data.
+- Kafka consumer tests cover payload dispatch, invalid messages, and offset
+  commits.
 - Celery import prints: notification.process_notification and task.
 - Queue inspection prints:
     task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
@@ -323,15 +358,16 @@ Relevant Files
 --------------
 - backend/app/base_config.py
   Settings, DEFAULT_AUTH_EXCLUDE_PATHS, DEFAULT_RATELIMIT_ROUTES,
-  ratelimit_routes native list, rabbitmq_url, SendGrid, PostgreSQL, Kafka,
-  Termii, and Redis settings plus split_csv helper.
+  ratelimit_routes native list, rabbitmq_url, SendGrid, PostgreSQL, Kafka
+  producer/consumer, Termii, and Redis settings plus split_csv helper.
 - backend/app/base_utils/__init__.py
   Shared utc_now helper used by the student and notification models.
 - backend/app/redis_config/__init__.py
   Async and synchronous Redis client factories built from Settings.
 - backend/app/main.py
   create_app, lifespan, Redis provider, route registration, middleware order,
-  and Notification import for table creation.
+  Notification import for table creation, WebSocket router inclusion, and
+  optional Kafka consumer startup/shutdown.
 - backend/app/security.py
   Argon2, JWT creation/verification, duration parsing, Express-compatible
   signed-cookie helpers.
@@ -379,10 +415,22 @@ Relevant Files
   SMSProvider backed by Termii, cache checks/writes, payload defaults, and
   error conversion.
 - backend/app/services/notification/pub_sub/__init__.py
-  Exports KafkaProducer.
-- backend/app/services/notification/pub_sub/kafka_producer.py
+  Exports KafkaProducer from the kafka subpackage.
+- backend/app/services/notification/pub_sub/kafka/__init__.py
+  Exports KafkaConsumer and KafkaProducer.
+- backend/app/services/notification/pub_sub/kafka/kafka_producer.py
   KafkaProducer singleton, lazy kafka-python client, JSON value serializer, and
   send(topic, payload).
+- backend/app/services/notification/pub_sub/kafka/kafka_consumer.py
+  KafkaConsumer loop, single-thread executor for blocking Kafka operations,
+  recipient/message dispatch, and offset commits.
+- backend/app/services/notification/ws/__init__.py
+  /notification WebSocket endpoint and router.
+- backend/app/services/notification/ws/authentication.py
+  authenticate_user dependency, token/session validation, and WebSocket close
+  codes.
+- backend/app/services/notification/ws/websocket_notif_manager.py
+  WebsocketNotificationManager, connection registry, and active-socket sends.
 - backend/app/services/notification/task/process_notification.py
   process_notification task, lock flow, retry handling, and final Reject.
 - backend/app/services/notification/task/__init__.py
@@ -408,6 +456,13 @@ Relevant Files
   payload validation.
 - backend/tests/test_kafka_producer.py
   KafkaProducer singleton, lazy client setup, JSON serializer, and send futures.
+- backend/tests/test_kafka_consumer.py
+  Kafka payload dispatch, invalid message handling, and offset commits.
+- backend/tests/test_ws_auth.py
+  WebSocket token/session authentication, close codes, endpoint connection, and
+  scope session data.
+- backend/tests/test_ws_manager.py
+  WebSocket registration, removal, active-only sends, and stale socket cleanup.
 - backend/celery_app.py
   Celery app, queue/DLX/DLQ declarations, retry and ack settings, task route,
   and the worker_init queue declaration.
@@ -423,10 +478,10 @@ Relevant Files
   uvicorn.
 - docker-compose.yml
   coursewave, worker, postgres, redis, and rabbitmq; shared backend environment
-  with SendGrid, Kafka, and Termii placeholders.
+  with SendGrid, Kafka producer/consumer, and Termii placeholders.
 - backend/README.md and README.md
   Architecture, middleware, auth, cache, rate-limit, notification, provider,
-  Celery, Kafka, Termii, and testing documentation.
+  WebSocket, Celery, Kafka, Termii, and testing documentation.
 - api_gateway/
   Deleted.
 
@@ -470,6 +525,14 @@ Important Context
 - SMSProvider sends notification.payload through termii-client
   messaging.send, fills from/type/channel defaults from Termii settings, and
   uses NotificationCacheMixin before and after delivery.
+- WebSocket route /notification requires ?token=<access token>.
+  authenticate_user loads Redis session:<sessionId>, sets websocket.state.user,
+  and closes with 1008 for auth/session errors or 1011 for Redis/session data
+  failures.
+- WebsocketNotificationManager keys connections by userId and sends only to
+  CONNECTED sockets with multiple sockets per user.
+- KafkaConsumer reads recipient_id/message from notification_topic payloads,
+  sends through the WebSocket manager, and commits each offset.
 - Processed notification cache key:
   notification:processed:<type>:<notification_id>; value "processed"; TTL 240
   seconds. Cache errors fail open.

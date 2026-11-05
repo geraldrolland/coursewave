@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-import app.services.notification.pub_sub.kafka_producer as kafka_module
+import app.services.notification.pub_sub.kafka.kafka_producer as kafka_module
 
 
 @pytest.fixture(autouse=True)

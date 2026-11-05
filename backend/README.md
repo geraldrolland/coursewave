@@ -21,6 +21,7 @@ directly.
 - Jinja-rendered email templates for OTP and email verification messages.
 - SendGrid email, Kafka push, and Termii SMS delivery through a provider
   registry.
+- Authenticated WebSocket notifications at `/notification`.
 - A four-minute Redis cache that skips already-processed notifications.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
@@ -63,11 +64,18 @@ backend/
 │       │   │   └── sms_provider.py
 │       │   ├── pub_sub/
 │       │   │   ├── __init__.py
-│       │   │   └── kafka_producer.py
+│       │   │   └── kafka/
+│       │   │       ├── __init__.py
+│       │   │       ├── kafka_consumer.py
+│       │   │       └── kafka_producer.py
 │       │   ├── task/
 │       │   │   └── process_notification.py
-│       │   └── template_manager/
-│       │       └── __init__.py
+│       │   ├── template_manager/
+│       │   │   └── __init__.py
+│       │   └── ws/
+│       │       ├── __init__.py
+│       │       ├── authentication.py
+│       │       └── websocket_notif_manager.py
 │       └── student/
 │           ├── exception/
 │           ├── model/
@@ -139,6 +147,8 @@ Copy-Item .env.example .env
 | `SENDGRID_FROM_NAME` | Sender display name used by the email provider | `CourseWave` |
 | `NOTIFICATION_TOPIC` | Kafka topic for push notifications | `notification` |
 | `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address for push delivery | `localhost:9092` |
+| `KAFKA_CONSUMER_ENABLED` | Start the Kafka-to-WebSocket consumer | `false` |
+| `KAFKA_CONSUMER_GROUP_ID` | Kafka consumer group for WebSocket delivery | `coursewave-notification-websockets` |
 | `TERMII_API_KEY` | Termii API key used by the SMS provider | `TERMII_API_KEY_PLACEHOLDER` |
 | `TERMII_SENDER_ID` | Registered Termii sender ID | `TERMII_SENDER_ID_PLACEHOLDER` |
 | `TERMII_CHANNEL` | Termii channel | `generic` |
@@ -489,7 +499,7 @@ SendGrid client and non-2xx response errors raise
 
 `PushProvider` publishes `notification.payload` to the Kafka topic configured by
 `NOTIFICATION_TOPIC` through the singleton producer in
-`app.services.notification.pub_sub.kafka_producer`. Kafka uses
+`app.services.notification.pub_sub.kafka.kafka_producer`. Kafka uses
 `KAFKA_BOOTSTRAP_SERVERS`. Producer or broker errors raise
 `ProviderServiceNotAvailableError`.
 
@@ -508,6 +518,41 @@ notification:processed:<notification-type>:<notification-id>
 A cached key causes the provider to return without sending again. After a
 successful send, the key is stored with the value `processed` and a 240-second
 TTL. Redis read and write failures fail open so delivery is not blocked.
+
+## WebSocket Notifications
+
+Clients connect to:
+
+```text
+ws://localhost:8000/notification?token=<access-token>
+```
+
+The `authenticate_user` dependency decodes the access token, requires
+`type == "access"`, loads `session:<sessionId>` from Redis, and stores the
+session in `websocket.state.user`.
+
+- Invalid or missing tokens and missing sessions close with code `1008`.
+- Redis failures and malformed stored sessions close with code `1011`.
+
+`WebsocketNotificationManager` tracks multiple sockets per `userId` and sends
+messages only to sockets whose client state is connected. Failed sockets are
+removed automatically.
+
+When `KAFKA_CONSUMER_ENABLED=true`, the API lifespan starts `KafkaConsumer`.
+It consumes `NOTIFICATION_TOPIC`, reads this payload shape, sends the message
+to the active sockets for `recipient_id`, and commits the offset:
+
+```json
+{
+  "recipient_id": "user-123",
+  "message": {
+    "title": "Notification title"
+  }
+}
+```
+
+The consumer uses `KAFKA_CONSUMER_GROUP_ID` and runs in the API process because
+it must share the in-memory WebSocket connection registry.
 
 ## Notifications
 
@@ -589,8 +634,9 @@ registration validation, password hashing, Redis token creation,
 duplicate-email handling, student auth-method defaults, notification model
 defaults, Celery queue topology, lock handling, retry behavior, final failure
 handling, provider dispatch, email template rendering, SendGrid error handling,
-Kafka producer publishing, Termii SMS delivery, and processed-notification
-caching.
+Kafka producer publishing, Kafka consumer dispatch and commits, Termii SMS
+delivery, WebSocket authentication and connection management, and
+processed-notification caching.
 
 ## Known Limitations
 
@@ -600,7 +646,8 @@ caching.
 - There is no notification enqueue endpoint or scheduler. Notification rows
   must be created and submitted by another component.
 - Kafka is not included in the Compose stack. Set `KAFKA_BOOTSTRAP_SERVERS` to
-  an existing broker for push delivery.
+  an existing broker for push delivery and set `KAFKA_CONSUMER_ENABLED=true`
+  to deliver Kafka messages to WebSocket clients.
 - SendGrid, Termii, and Kafka configuration defaults are placeholders and must
   be replaced before production use.
 - There is no migration framework. Existing databases need the `notification`
