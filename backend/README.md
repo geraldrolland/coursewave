@@ -90,6 +90,7 @@ backend/
 │           └── v1.html
 ├── tests/
 ├── .env.example
+├── pytest.ini
 ├── requirements.txt
 └── requirements-dev.txt
 ```

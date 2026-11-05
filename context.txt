@@ -296,6 +296,8 @@ Completed
   WebsocketNotificationManager, and Kafka-to-WebSocket delivery.
 - Wired the WebSocket router and optional Kafka consumer lifecycle into the
   FastAPI app.
+- Replaced the deprecated httpx TestClient dependency with httpx2 and added
+  targeted pytest filters for kafka-python's importlib.resources warnings.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -327,7 +329,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 180 passed (Starlette/httpx and kafka-python deprecation warnings).
+- pytest -q: 180 passed, no warnings.
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -473,6 +475,10 @@ Relevant Files
 - backend/requirements.txt
   FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, SendGrid, kafka-python,
   termii-client, and auth dependencies.
+- backend/requirements-dev.txt
+  pytest and httpx2 test dependencies.
+- backend/pytest.ini
+  Targeted filters for kafka-python importlib.resources deprecation warnings.
 - backend/Dockerfile
   Installs requirements, copies app, templates, and celery_app.py, and runs
   uvicorn.
