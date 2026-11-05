@@ -28,6 +28,8 @@ from app.services.notification.provider.email_provider import (
     EmailProvider,
 )
 from app.services.notification.provider.provider_registery import provider_registery
+from app.services.notification.provider.push_provider import PushProvider
+from app.services.notification.provider.sms_provider import SMSProvider
 
 
 class FakeSyncRedis:
@@ -77,31 +79,63 @@ def notification_cache_key(notification: Notification) -> str:
     )
 
 
-def test_provider_registry_contains_email_provider() -> None:
-    provider = provider_registery["email"]
+def test_provider_registry_contains_supported_providers() -> None:
+    assert isinstance(provider_registery["email"], EmailProvider)
+    assert isinstance(provider_registery["push"], PushProvider)
+    assert isinstance(provider_registery["sms"], SMSProvider)
 
-    assert isinstance(provider, EmailProvider)
-    assert isinstance(provider, BaseProvider)
+    for provider in provider_registery.values():
+        assert isinstance(provider, BaseProvider)
 
 
-def test_provider_manager_returns_registered_email_provider() -> None:
-    manager = ProviderManager()
+@pytest.mark.parametrize(
+    ("provider_type", "provider_class"),
+    [
+        ("email", EmailProvider),
+        ("push", PushProvider),
+        ("sms", SMSProvider),
+        (ProviderType.EMAIL, EmailProvider),
+        (ProviderType.PUSH, PushProvider),
+        (ProviderType.SMS, SMSProvider),
+    ],
+)
+def test_provider_manager_returns_registered_provider(
+    provider_type: str | ProviderType,
+    provider_class: type[BaseProvider],
+) -> None:
+    provider = ProviderManager.get_provider(provider_type)
+    provider_key = (
+        provider_type.value
+        if isinstance(provider_type, ProviderType)
+        else provider_type
+    )
 
-    assert manager.get_provider("email") is provider_registery["email"]
-    assert manager.get_provider(ProviderType.EMAIL) is provider_registery["email"]
-    assert ProviderManager.get_provider("email") is provider_registery["email"]
+    assert isinstance(provider, provider_class)
+    assert provider is provider_registery[provider_key]
+
+
+def test_provider_manager_accepts_notification_type() -> None:
+    assert isinstance(
+        ProviderManager.get_provider(NotificationType.EMAIL),
+        EmailProvider,
+    )
+    assert isinstance(
+        ProviderManager.get_provider(NotificationType.PUSH),
+        PushProvider,
+    )
+    assert isinstance(
+        ProviderManager.get_provider(NotificationType.SMS),
+        SMSProvider,
+    )
 
 
 def test_provider_service_error_spelling_alias() -> None:
     assert ProviderServiceNotAvailbleError is ProviderServiceNotAvailableError
 
 
-@pytest.mark.parametrize(
-    "provider_type",
-    ["push", "sms", ProviderType.PUSH, ProviderType.SMS, "unknown"],
-)
+@pytest.mark.parametrize("provider_type", ["unknown", "email_v2"])
 def test_provider_manager_raises_for_unregistered_provider(
-    provider_type: str | ProviderType,
+    provider_type: str,
 ) -> None:
     with pytest.raises(ProviderNotFoundError):
         ProviderManager().get_provider(provider_type)

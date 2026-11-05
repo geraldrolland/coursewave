@@ -19,6 +19,7 @@ from app.services.notification.model import (
 from app.services.notification.task import process_notification
 from app.services.notification.task.process_notification import (
     NOTIFICATION_LOCK_TTL_SECONDS,
+    ProviderManager,
     _process_notification,
 )
 from celery_app import celery_app, declare_queues
@@ -116,7 +117,7 @@ def test_notification_model_defaults_and_enums() -> None:
 
     assert notification.notification_id is not None
     assert notification.status is NotificationStatus.PENDING
-    assert notification.send() is None
+    assert not hasattr(notification, "send")
     assert Notification.__table__.c.status.nullable is False
     assert "release_after" not in Notification.__table__.columns
     assert [member.value for member in NotificationType] == [
@@ -237,15 +238,25 @@ def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -
     factory = FakeSessionFactory(notification)
     task = FakeTask()
     sent: list[UUID] = []
+    provider_types: list[NotificationType] = []
 
-    def fake_send(self: Notification) -> None:
-        sent.append(self.notification_id)
-        assert redis.ttls[
-            f"notification:process:{self.notification_id}"
-        ] == NOTIFICATION_LOCK_TTL_SECONDS
-        assert f"notification:commit:{self.notification_id}" not in redis.values
+    class FakeProvider:
+        def process(self, notification: Notification) -> None:
+            sent.append(notification.notification_id)
+            assert redis.ttls[
+                f"notification:process:{notification.notification_id}"
+            ] == NOTIFICATION_LOCK_TTL_SECONDS
+            assert f"notification:commit:{notification.notification_id}" not in redis.values
 
-    monkeypatch.setattr(Notification, "send", fake_send)
+    def get_provider(provider_type: NotificationType) -> FakeProvider:
+        provider_types.append(provider_type)
+        return FakeProvider()
+
+    monkeypatch.setattr(
+        ProviderManager,
+        "get_provider",
+        get_provider,
+    )
 
     asyncio.run(
         _process_notification(
@@ -257,6 +268,7 @@ def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert sent == [notification.notification_id]
+    assert provider_types == [NotificationType.EMAIL]
     assert notification.status is NotificationStatus.PROCESSED
     assert factory.commits == [NotificationStatus.PROCESSED]
     assert f"notification:process:{notification.notification_id}" not in redis.values
@@ -270,12 +282,14 @@ def test_already_processed_notification_is_skipped(
     redis = FakeRedis()
     factory = FakeSessionFactory(notification)
     task = FakeTask()
-    sent: list[UUID] = []
+
+    def get_provider(_: NotificationType) -> None:
+        pytest.fail("Provider must not be resolved for a processed notification")
 
     monkeypatch.setattr(
-        Notification,
-        "send",
-        lambda self: sent.append(self.notification_id),
+        ProviderManager,
+        "get_provider",
+        get_provider,
     )
 
     asyncio.run(
@@ -287,7 +301,6 @@ def test_already_processed_notification_is_skipped(
         )
     )
 
-    assert sent == []
     assert notification.status is NotificationStatus.PROCESSED
     assert factory.commits == []
     assert f"notification:process:{notification.notification_id}" not in redis.values
@@ -325,10 +338,15 @@ def test_notification_error_retries_before_max_retries(
     factory = FakeSessionFactory(notification)
     task = FakeTask(retries=0)
 
-    def failing_send(self: Notification) -> None:
-        raise NotificationError("delivery failed")
+    class FailingProvider:
+        def process(self, notification: Notification) -> None:
+            raise NotificationError("delivery failed")
 
-    monkeypatch.setattr(Notification, "send", failing_send)
+    monkeypatch.setattr(
+        ProviderManager,
+        "get_provider",
+        lambda _: FailingProvider(),
+    )
 
     with pytest.raises(NotificationError):
         asyncio.run(
@@ -355,10 +373,15 @@ def test_notification_error_marks_failed_and_rejects_after_max_retries(
     factory = FakeSessionFactory(notification)
     task = FakeTask(retries=5)
 
-    def failing_send(self: Notification) -> None:
-        raise NotificationError("delivery failed")
+    class FailingProvider:
+        def process(self, notification: Notification) -> None:
+            raise NotificationError("delivery failed")
 
-    monkeypatch.setattr(Notification, "send", failing_send)
+    monkeypatch.setattr(
+        ProviderManager,
+        "get_provider",
+        lambda _: FailingProvider(),
+    )
 
     with pytest.raises(Reject) as exc_info:
         asyncio.run(

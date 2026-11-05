@@ -17,6 +17,7 @@ from app.db_config import create_postgresql_engine
 from app.redis_config import create_redis_client
 from app.services.notification.exception import NotificationError
 from app.services.notification.model import Notification, NotificationStatus
+from app.services.notification.provider import ProviderManager
 from celery_app import celery_app
 
 logger = logging.getLogger("notification_service.task.process_notification")
@@ -68,7 +69,8 @@ async def _process_notification(
                 return
 
             try:
-                notification.send()
+                provider = ProviderManager.get_provider(notification.type)
+                provider.process(notification)
             except NotificationError as exc:
                 if task.request.retries >= task.max_retries:
                     notification.status = NotificationStatus.FAILED

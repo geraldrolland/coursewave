@@ -38,6 +38,14 @@ x-backend-environment: &backend-environment
   SENDGRID_FROM_EMAIL: "${SENDGRID_FROM_EMAIL:-no-reply@coursewave.example}"
   SENDGRID_FROM_NAME: "${SENDGRID_FROM_NAME:-CourseWave}"
 
+  NOTIFICATION_TOPIC: "${NOTIFICATION_TOPIC:-notification}"
+  KAFKA_BOOTSTRAP_SERVERS: "${KAFKA_BOOTSTRAP_SERVERS:-host.docker.internal:9092}"
+
+  TERMII_API_KEY: "${TERMII_API_KEY:-TERMII_API_KEY_PLACEHOLDER}"
+  TERMII_SENDER_ID: "${TERMII_SENDER_ID:-TERMII_SENDER_ID_PLACEHOLDER}"
+  TERMII_CHANNEL: "${TERMII_CHANNEL:-generic}"
+  TERMII_MESSAGE_TYPE: "${TERMII_MESSAGE_TYPE:-plain}"
+
 services:
   redis:
     image: redis:7-alpine

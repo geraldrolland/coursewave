@@ -101,12 +101,3 @@ class Notification(SQLModel, table=True):
             onupdate=func.now(),
         ),
     )
-
-    def send(self) -> None:
-        """Deliver the notification.
-
-        Delivery channels are not implemented yet, so this is a no-op.
-        Implementations may raise :class:`NotificationError`.
-        """
-
-        return None

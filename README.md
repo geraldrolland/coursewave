@@ -2,6 +2,7 @@
 
 CourseWave is a student platform built around a FastAPI backend, PostgreSQL,
 Redis, RabbitMQ, and a Celery worker for asynchronous notification delivery.
+Kafka is used for push notification fan-out through an external broker.
 
 ## Services
 

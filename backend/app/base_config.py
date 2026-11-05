@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     sendgrid_from_email: str = "no-reply@coursewave.example"
     sendgrid_from_name: str = "CourseWave"
 
+    notification_topic: str = "notification"
+    kafka_bootstrap_servers: str = "localhost:9092"
+
+    termii_api_key: str = "TERMII_API_KEY_PLACEHOLDER"
+    termii_sender_id: str = "TERMII_SENDER_ID_PLACEHOLDER"
+    termii_channel: str = "generic"
+    termii_message_type: str = "plain"
+
     jwt_secret: str = "change-me-in-production"
     cookie_secret: str = "change-me-in-production"
     access_token_expiry: str = "7m"

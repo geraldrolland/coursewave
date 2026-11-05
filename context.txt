@@ -12,9 +12,10 @@ requested refinements:
 - A notification model and Celery task backed by RabbitMQ queues, Redis locks,
   retries, and a dead-letter queue.
 - A typed Jinja email template manager for OTP and email verification messages,
-  plus a notification provider registry with SendGrid email delivery.
+  plus a notification provider registry with SendGrid email, Kafka push, and
+  Termii SMS delivery.
 - The backend is the public API; api_gateway/ has been deleted.
-- RabbitMQ replaces Kafka.
+- RabbitMQ handles Celery tasks; Kafka handles push notification fan-out.
 - No Docker containers are started during development/validation.
 
 
@@ -79,8 +80,8 @@ Notifications and Celery
     created_at / updated_at: timezone-aware datetimes
 - Database enum names: notification_type, notification_audience, and
   notification_status. They store lowercase values.
-- Notification.send() is a synchronous no-op placeholder. Real delivery code may
-  raise NotificationError.
+- Notification has no send() method. process_notification resolves a provider
+  through ProviderManager and calls provider.process(notification).
 - Celery configuration lives in backend/celery_app.py. It imports
   app.services.notification.task.process_notification and exposes `app` for
   `celery -A celery_app`.
@@ -103,7 +104,8 @@ Notifications and Celery
     2. If busy, retry with countdown=120 seconds (the lock TTL).
     3. Load the notification.
     4. Return if status is already processed.
-    5. Call notification.send().
+    5. Resolve the provider from notification.type and call
+       provider.process(notification).
     6. Success: set status=processed and commit.
     7. NotificationError before the last attempt: re-raise so Celery autoretries
        with exponential backoff and jitter.
@@ -153,8 +155,9 @@ Notification Providers
 - New package at backend/app/services/notification/provider/.
 - ProviderType is a str enum with EMAIL = "email", PUSH = "push", and
   SMS = "sms".
-- provider_registery.py creates `email_provider = EmailProvider()` and maps
-  {"email": email_provider}; push and SMS are intentionally unregistered.
+- provider_registery.py creates email_provider = EmailProvider(),
+  push_provider = PushProvider(), and sms_provider = SMSProvider(), then maps
+  {"email": email_provider, "push": push_provider, "sms": sms_provider}.
 - ProviderManager.get_provider(provider_type) accepts a string or enum and
   raises ProviderNotFoundError for unknown or unregistered types.
 - BaseProvider defines abstract process(notification).
@@ -170,12 +173,24 @@ Notification Providers
   recognizes them.
 - SendGrid settings use SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, and
   SENDGRID_FROM_NAME, with placeholder defaults.
+- PushProvider inherits NotificationCacheMixin and BaseProvider. It publishes
+  notification.payload to the Kafka notification_topic through the singleton
+  producer in backend/app/services/notification/pub_sub/kafka_producer.py.
+- Kafka settings use notification_topic (default "notification") and
+  kafka_bootstrap_servers (default "localhost:9092").
+- The Kafka producer lazily creates a kafka-python KafkaProducer with a JSON
+  value serializer, acks="all", and retries=3. send() waits for the future.
+- SMSProvider inherits BaseProvider and sends notification.payload through the
+  Termii SDK (termii-client). It fills from/type/channel defaults from settings.
+- Termii settings use TERMII_API_KEY, TERMII_SENDER_ID, TERMII_CHANNEL, and
+  TERMII_MESSAGE_TYPE, with placeholder defaults.
 - NotificationCacheMixin uses synchronous Redis via
   create_sync_redis_client(settings).
 - Processed-notification key format:
   notification:processed:<notification type>:<notification id>.
-- The cached value is "processed" with a 240-second TTL. EmailProvider checks
-  the key before processing and writes it only after a successful SendGrid send.
+- The cached value is "processed" with a 240-second TTL. EmailProvider and
+  PushProvider check the key before processing and write it only after a
+  successful send.
 - Redis cache read/write failures fail open and log a warning.
 
 Prior decisions that remain in place
@@ -189,7 +204,8 @@ Prior decisions that remain in place
 - The Outbox model and all outbox writes are removed.
 - New error bodies use {"detail": "..."}.
 - Compose service is named coursewave, builds ./backend, publishes 3000:8000.
-- RabbitMQ replaces Kafka; Kafka and api_gateway/ are removed.
+- RabbitMQ handles Celery; Kafka is used only for push notifications;
+  api_gateway/ is removed.
 - Refresh is BaseHTTPMiddleware handling POST /auth/api/v1/token-refresh.
 - Auth, Cache, RateLimit, RefreshToken, and RequestLogger are all Starlette
   BaseHTTPMiddleware; CORS remains the built-in CORSMiddleware.
@@ -243,6 +259,12 @@ Completed
   spelling alias.
 - Added NotificationCacheMixin and a synchronous Redis client factory, then
   integrated processed-notification cache checks and writes into EmailProvider.
+- Removed Notification.send and updated process_notification to resolve and
+  invoke the provider from ProviderManager.
+- Added the pub_sub Kafka producer singleton, PushProvider with cache support,
+  SMSProvider backed by Termii, and registered push/sms providers.
+- Added Kafka and Termii settings, dependencies, environment examples, and
+  producer/provider tests.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -258,8 +280,9 @@ Next Move
 Known Gaps
 - No notification enqueue endpoint or scheduler exists; another component must
   insert Notification rows and submit the task.
-- Notification.send() remains a no-op and is not wired to ProviderManager, so
-  successful tasks currently mark rows processed without external delivery.
+- Kafka is not included in docker-compose.yml; push delivery requires an
+  external broker configured by kafka_bootstrap_servers.
+- SendGrid, Termii, and Kafka defaults are placeholders that must be replaced.
 - No login/token-issuer endpoint exists; auth validates existing access tokens
   and refresh rotates existing sessions only.
 - No migration framework exists. Existing databases need the notification table
@@ -270,14 +293,17 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 147 passed (one Starlette/httpx deprecation warning).
+- pytest -q: 163 passed (Starlette/httpx and kafka-python deprecation warnings).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
 - TemplateManager renders metadata version_number=1 and relative template_path;
-  ProviderManager resolves EMAIL to EmailProvider/BaseProvider.
+  ProviderManager resolves EMAIL/PUSH/SMS to EmailProvider/PushProvider/
+  SMSProvider.
 - Processed-notification cache stores value=processed with a 240-second TTL,
   skips cached notifications, and fails open on Redis errors.
+- KafkaProducer is a lazy singleton with JSON serialization and send futures;
+  PushProvider and SMSProvider tests cover success and failure paths.
 - Celery import prints: notification.process_notification and task.
 - Queue inspection prints:
     task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
@@ -294,8 +320,8 @@ Relevant Files
 --------------
 - backend/app/base_config.py
   Settings, DEFAULT_AUTH_EXCLUDE_PATHS, DEFAULT_RATELIMIT_ROUTES,
-  ratelimit_routes native list, rabbitmq_url, SendGrid email settings, and
-  split_csv helper.
+  ratelimit_routes native list, rabbitmq_url, SendGrid, PostgreSQL, Kafka,
+  Termii, and Redis settings plus split_csv helper.
 - backend/app/base_utils/__init__.py
   Shared utc_now helper used by the student and notification models.
 - backend/app/redis_config/__init__.py
@@ -323,7 +349,7 @@ Relevant Files
   Public registration route and student endpoints.
 - backend/app/services/notification/model/notification.py
   Notification SQLModel, NotificationType/Audience/Status enums, JSON payload,
-  timestamps, and the send() placeholder.
+  and timestamps. The send() method is removed.
 - backend/app/services/notification/exception/__init__.py
   NotificationServiceError, NotificationError, ProviderError,
   ProviderNotFoundError, ProviderNotAvailableError,
@@ -341,8 +367,18 @@ Relevant Files
   cache checks/writes, ProviderError wrapping, and
   ProviderServiceNotAvailableError conversion.
 - backend/app/services/notification/provider/provider_registery.py
-  ProviderType enum, email_provider instance, and {"email": email_provider}
+  ProviderType enum, email/push/sms provider instances, and the three-key
   registry.
+- backend/app/services/notification/provider/push_provider.py
+  PushProvider with Kafka publishing, cache checks/writes, payload validation,
+  and ProviderServiceNotAvailableError wrapping.
+- backend/app/services/notification/provider/sms_provider.py
+  SMSProvider backed by Termii, payload defaults, and error conversion.
+- backend/app/services/notification/pub_sub/__init__.py
+  Exports KafkaProducer.
+- backend/app/services/notification/pub_sub/kafka_producer.py
+  KafkaProducer singleton, lazy kafka-python client, JSON value serializer, and
+  send(topic, payload).
 - backend/app/services/notification/task/process_notification.py
   process_notification task, lock flow, retry handling, and final Reject.
 - backend/app/services/notification/task/__init__.py
@@ -360,6 +396,13 @@ Relevant Files
 - backend/tests/test_provider.py
   Provider registry/manager lookup, missing providers, SendGrid delivery,
   payload variants, and error handling tests.
+- backend/tests/test_push_provider.py
+  PushProvider Kafka publishing, cache behavior, payload validation, and error
+  handling.
+- backend/tests/test_sms_provider.py
+  SMSProvider Termii payload defaults, error responses, and payload validation.
+- backend/tests/test_kafka_producer.py
+  KafkaProducer singleton, lazy client setup, JSON serializer, and send futures.
 - backend/celery_app.py
   Celery app, queue/DLX/DLQ declarations, retry and ack settings, task route,
   and the worker_init queue declaration.
@@ -368,17 +411,17 @@ Relevant Files
 - backend/tests/test_notification.py
   Model, queue topology, worker declaration, lock, retry, and failure tests.
 - backend/requirements.txt
-  FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, SendGrid, and auth
-  dependencies.
+  FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, SendGrid, kafka-python,
+  termii-client, and auth dependencies.
 - backend/Dockerfile
   Installs requirements, copies app, templates, and celery_app.py, and runs
   uvicorn.
 - docker-compose.yml
   coursewave, worker, postgres, redis, and rabbitmq; shared backend environment
-  and SendGrid placeholders.
+  with SendGrid, Kafka, and Termii placeholders.
 - backend/README.md and README.md
-  Architecture, middleware, auth, cache, rate-limit, notification, Celery, and
-  testing documentation.
+  Architecture, middleware, auth, cache, rate-limit, notification, provider,
+  Celery, Kafka, Termii, and testing documentation.
 - api_gateway/
   Deleted.
 
@@ -408,11 +451,19 @@ Important Context
   TemplateType. Email verification templates use the `link` content key; OTP
   templates use `otp`. Rendered templates expose body, version_number, and
   template_path; subjects are provider-owned.
-- ProviderManager only has an `email` provider registered. Email notifications
-  expect payload keys template_type, content, and to_email (email fallback).
+- Notification has no send() method. The task resolves ProviderManager using
+  notification.type and calls provider.process(notification).
+- ProviderManager has email, push, and sms providers registered. Email
+  notifications expect payload keys template_type, content, and to_email
+  (email fallback).
 - EmailProvider raises ProviderError for payload/rendering/message-building
   failures and ProviderServiceNotAvailableError for SendGrid client or non-2xx
   response failures.
+- PushProvider sends notification.payload to Kafka topic notification_topic
+  through the KafkaProducer singleton. Kafka errors become
+  ProviderServiceNotAvailableError.
+- SMSProvider sends notification.payload through termii-client
+  messaging.send and fills from/type/channel defaults from Termii settings.
 - Processed notification cache key:
   notification:processed:<type>:<notification_id>; value "processed"; TTL 240
   seconds. Cache errors fail open.

@@ -19,8 +19,10 @@ directly.
 - Asynchronous notification processing through Celery, RabbitMQ quorum queues,
   and Redis locks.
 - Jinja-rendered email templates for OTP and email verification messages.
-- SendGrid-backed notification email delivery through a provider registry.
-- A four-minute Redis cache that skips already-processed notifications.
+- SendGrid email, Kafka push, and Termii SMS delivery through a provider
+  registry.
+- A four-minute Redis cache that skips already-processed email and push
+  notifications.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -57,7 +59,12 @@ backend/
 │       │   │   ├── base.py
 │       │   │   ├── cache_mixin.py
 │       │   │   ├── email_provider.py
-│       │   │   └── provider_registery.py
+│       │   │   ├── provider_registery.py
+│       │   │   ├── push_provider.py
+│       │   │   └── sms_provider.py
+│       │   ├── pub_sub/
+│       │   │   ├── __init__.py
+│       │   │   └── kafka_producer.py
 │       │   ├── task/
 │       │   │   └── process_notification.py
 │       │   └── template_manager/
@@ -131,6 +138,12 @@ Copy-Item .env.example .env
 | `SENDGRID_API_KEY` | SendGrid API key used by the email provider | `SENDGRID_API_KEY_PLACEHOLDER` |
 | `SENDGRID_FROM_EMAIL` | Verified sender address used by the email provider | `no-reply@coursewave.example` |
 | `SENDGRID_FROM_NAME` | Sender display name used by the email provider | `CourseWave` |
+| `NOTIFICATION_TOPIC` | Kafka topic for push notifications | `notification` |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address for push delivery | `localhost:9092` |
+| `TERMII_API_KEY` | Termii API key used by the SMS provider | `TERMII_API_KEY_PLACEHOLDER` |
+| `TERMII_SENDER_ID` | Registered Termii sender ID | `TERMII_SENDER_ID_PLACEHOLDER` |
+| `TERMII_CHANNEL` | Termii channel | `generic` |
+| `TERMII_MESSAGE_TYPE` | Termii message type | `plain` |
 
 ### Run
 
@@ -448,8 +461,8 @@ provider.process(notification)
 ```
 
 `ProviderManager.get_provider()` accepts `email`, `push`, and `sms` strings or
-their `ProviderType` enum members. Only `email` is registered. Looking up an
-unregistered or unknown type raises `ProviderNotFoundError`.
+their `ProviderType` enum members. Looking up an unknown type raises
+`ProviderNotFoundError`.
 
 Providers implement `BaseProvider.process(notification)`. The built-in
 `EmailProvider` uses SendGrid and expects this payload shape:
@@ -475,8 +488,19 @@ SendGrid client and non-2xx response errors raise
 `ProviderServiceNotAvailbleError` spelling). Both are subclasses of
 `NotificationError` so the existing Celery retry flow handles them.
 
-`EmailProvider` also inherits `NotificationCacheMixin`. Before processing, it
-checks Redis for:
+`PushProvider` publishes `notification.payload` to the Kafka topic configured by
+`NOTIFICATION_TOPIC` through the singleton producer in
+`app.services.notification.pub_sub.kafka_producer`. Kafka uses
+`KAFKA_BOOTSTRAP_SERVERS`. Producer or broker errors raise
+`ProviderServiceNotAvailableError`.
+
+`SMSProvider` sends `notification.payload` through Termii using
+`termii-client`. Missing sender and routing fields are filled from
+`TERMII_SENDER_ID`, `TERMII_MESSAGE_TYPE`, and `TERMII_CHANNEL`. Termii settings
+are placeholders until real credentials are supplied.
+
+`EmailProvider` and `PushProvider` inherit `NotificationCacheMixin`. Before
+processing, they check Redis for:
 
 ```text
 notification:processed:<notification-type>:<notification-id>
@@ -484,9 +508,7 @@ notification:processed:<notification-type>:<notification-id>
 
 A cached key causes the provider to return without sending again. After a
 successful send, the key is stored with the value `processed` and a 240-second
-TTL. Redis read and write failures fail open so email delivery is not blocked.
-
-`Notification.send()` is not wired to the provider manager yet.
+TTL. Redis read and write failures fail open so delivery is not blocked.
 
 ## Notifications
 
@@ -503,9 +525,9 @@ Notifications are persisted in the `notification` table and delivered by the
 | `status` | `pending`, `processed`, `failed` | Defaults to `pending` |
 | `created_at`, `updated_at` | timezone-aware datetimes | Audit timestamps |
 
-`Notification.send()` is a synchronous placeholder and currently returns
-without delivering anything. Real channel integrations should raise
-`NotificationError` when delivery fails.
+The task resolves the provider using
+`ProviderManager.get_provider(notification.type)` and calls
+`provider.process(notification)`.
 
 ### Task flow
 
@@ -516,7 +538,7 @@ without delivering anything. Real channel integrations should raise
    countdown.
 3. Loads the notification.
 4. Returns if the status is already `processed`.
-5. Calls `notification.send()`.
+5. Resolves the notification provider and calls `provider.process(notification)`.
 6. On success, marks the notification `processed`.
 7. On `NotificationError`, retries with 10 seconds of exponential backoff and
    jitter (`max_retries=5`). After the final attempt it marks the notification
@@ -567,8 +589,9 @@ rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
 duplicate-email handling, student auth-method defaults, notification model
 defaults, Celery queue topology, lock handling, retry behavior, final failure
-handling, email template rendering, provider lookup, SendGrid error handling,
-and processed-notification caching.
+handling, provider dispatch, email template rendering, SendGrid error handling,
+Kafka producer publishing, Termii SMS delivery, and processed-notification
+caching.
 
 ## Known Limitations
 
@@ -576,8 +599,11 @@ and processed-notification caching.
   refresh tokens must be issued by another service that creates the matching
   Redis session.
 - There is no notification enqueue endpoint or scheduler. Notification rows
-  must be created and submitted by another component, and `send()` remains a
-  no-op until it is wired to the provider manager.
+  must be created and submitted by another component.
+- Kafka is not included in the Compose stack. Set `KAFKA_BOOTSTRAP_SERVERS` to
+  an existing broker for push delivery.
+- SendGrid, Termii, and Kafka configuration defaults are placeholders and must
+  be replaced before production use.
 - There is no migration framework. Existing databases need the `notification`
   table created manually because `AUTO_CREATE_TABLES` only creates missing
   tables on a fresh database. If an earlier schema exists, drop the unused
