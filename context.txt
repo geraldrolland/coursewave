@@ -180,17 +180,18 @@ Notification Providers
   kafka_bootstrap_servers (default "localhost:9092").
 - The Kafka producer lazily creates a kafka-python KafkaProducer with a JSON
   value serializer, acks="all", and retries=3. send() waits for the future.
-- SMSProvider inherits BaseProvider and sends notification.payload through the
-  Termii SDK (termii-client). It fills from/type/channel defaults from settings.
+- SMSProvider inherits NotificationCacheMixin and BaseProvider and sends
+  notification.payload through the Termii SDK (termii-client). It fills
+  from/type/channel defaults from settings and caches successful sends.
 - Termii settings use TERMII_API_KEY, TERMII_SENDER_ID, TERMII_CHANNEL, and
   TERMII_MESSAGE_TYPE, with placeholder defaults.
 - NotificationCacheMixin uses synchronous Redis via
   create_sync_redis_client(settings).
 - Processed-notification key format:
   notification:processed:<notification type>:<notification id>.
-- The cached value is "processed" with a 240-second TTL. EmailProvider and
-  PushProvider check the key before processing and write it only after a
-  successful send.
+- The cached value is "processed" with a 240-second TTL. EmailProvider,
+  PushProvider, and SMSProvider check the key before processing and write it
+  only after a successful send.
 - Redis cache read/write failures fail open and log a warning.
 
 Prior decisions that remain in place
@@ -265,6 +266,8 @@ Completed
   SMSProvider backed by Termii, and registered push/sms providers.
 - Added Kafka and Termii settings, dependencies, environment examples, and
   producer/provider tests.
+- Extended NotificationCacheMixin to SMSProvider, including cache skips and
+  successful-send writes.
 - Updated backend/README.md, README.md, and this context file.
 
 Active
@@ -293,7 +296,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 163 passed (Starlette/httpx and kafka-python deprecation warnings).
+- pytest -q: 164 passed (Starlette/httpx and kafka-python deprecation warnings).
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -373,7 +376,8 @@ Relevant Files
   PushProvider with Kafka publishing, cache checks/writes, payload validation,
   and ProviderServiceNotAvailableError wrapping.
 - backend/app/services/notification/provider/sms_provider.py
-  SMSProvider backed by Termii, payload defaults, and error conversion.
+  SMSProvider backed by Termii, cache checks/writes, payload defaults, and
+  error conversion.
 - backend/app/services/notification/pub_sub/__init__.py
   Exports KafkaProducer.
 - backend/app/services/notification/pub_sub/kafka_producer.py
@@ -400,7 +404,8 @@ Relevant Files
   PushProvider Kafka publishing, cache behavior, payload validation, and error
   handling.
 - backend/tests/test_sms_provider.py
-  SMSProvider Termii payload defaults, error responses, and payload validation.
+  SMSProvider Termii payload defaults, cache behavior, error responses, and
+  payload validation.
 - backend/tests/test_kafka_producer.py
   KafkaProducer singleton, lazy client setup, JSON serializer, and send futures.
 - backend/celery_app.py
@@ -463,7 +468,8 @@ Important Context
   through the KafkaProducer singleton. Kafka errors become
   ProviderServiceNotAvailableError.
 - SMSProvider sends notification.payload through termii-client
-  messaging.send and fills from/type/channel defaults from Termii settings.
+  messaging.send, fills from/type/channel defaults from Termii settings, and
+  uses NotificationCacheMixin before and after delivery.
 - Processed notification cache key:
   notification:processed:<type>:<notification_id>; value "processed"; TTL 240
   seconds. Cache errors fail open.

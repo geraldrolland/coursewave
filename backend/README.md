@@ -21,8 +21,7 @@ directly.
 - Jinja-rendered email templates for OTP and email verification messages.
 - SendGrid email, Kafka push, and Termii SMS delivery through a provider
   registry.
-- A four-minute Redis cache that skips already-processed email and push
-  notifications.
+- A four-minute Redis cache that skips already-processed notifications.
 - PostgreSQL access through an async request-scoped SQLModel session.
 
 ## Project Structure
@@ -499,8 +498,8 @@ SendGrid client and non-2xx response errors raise
 `TERMII_SENDER_ID`, `TERMII_MESSAGE_TYPE`, and `TERMII_CHANNEL`. Termii settings
 are placeholders until real credentials are supplied.
 
-`EmailProvider` and `PushProvider` inherit `NotificationCacheMixin`. Before
-processing, they check Redis for:
+`EmailProvider`, `PushProvider`, and `SMSProvider` inherit
+`NotificationCacheMixin`. Before processing, they check Redis for:
 
 ```text
 notification:processed:<notification-type>:<notification-id>

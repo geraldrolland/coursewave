@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from redis.exceptions import RedisError
 
 from app.base_config import get_settings
 from app.services.notification.exception import (
@@ -16,7 +17,39 @@ from app.services.notification.model import (
     NotificationType,
 )
 from app.services.notification.provider.base import BaseProvider
+from app.services.notification.provider.cache_mixin import (
+    PROCESSED_NOTIFICATION_TTL_SECONDS,
+    PROCESSED_NOTIFICATION_VALUE,
+    NotificationCacheMixin,
+)
 from app.services.notification.provider.sms_provider import SMSProvider
+
+
+class FakeSyncRedis:
+    """Minimal synchronous Redis double for SMS cache tests."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.ttls: dict[str, int | None] = {}
+        self.fail_exists = False
+        self.fail_set = False
+
+    def exists(self, key: str) -> int:
+        if self.fail_exists:
+            raise RedisError("Redis read failed")
+        return int(key in self.values)
+
+    def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+    ) -> bool:
+        if self.fail_set:
+            raise RedisError("Redis write failed")
+        self.values[key] = value
+        self.ttls[key] = ex
+        return True
 
 
 class FakeTermiiMessaging:
@@ -60,16 +93,30 @@ def make_notification(payload: dict[str, Any]) -> Notification:
     )
 
 
-def test_sms_provider_inherits_base_provider() -> None:
-    assert isinstance(SMSProvider(client=FakeTermii()), BaseProvider)
+def notification_cache_key(notification: Notification) -> str:
+    """Return the expected processed-notification cache key."""
+
+    return (
+        f"notification:processed:{notification.type.value}:"
+        f"{notification.notification_id}"
+    )
+
+
+def test_sms_provider_inherits_base_provider_and_cache_mixin() -> None:
+    provider = SMSProvider(client=FakeTermii(), redis_client=FakeSyncRedis())
+
+    assert isinstance(provider, BaseProvider)
+    assert isinstance(provider, NotificationCacheMixin)
 
 
 def test_sms_provider_sends_payload_with_defaults() -> None:
     client = FakeTermii()
-    provider = SMSProvider(client=client)
+    redis = FakeSyncRedis()
+    provider = SMSProvider(client=client, redis_client=redis)
     payload = {"to": "2348012345678", "sms": "Hello from CourseWave"}
     notification = make_notification(payload)
     settings = get_settings()
+    cache_key = notification_cache_key(notification)
 
     provider.process(notification)
 
@@ -83,11 +130,16 @@ def test_sms_provider_sends_payload_with_defaults() -> None:
     assert "from" not in payload
     assert "type" not in payload
     assert "channel" not in payload
+    assert redis.values[cache_key] == PROCESSED_NOTIFICATION_VALUE
+    assert redis.ttls[cache_key] == PROCESSED_NOTIFICATION_TTL_SECONDS
 
 
 def test_sms_provider_accepts_json_payload() -> None:
     client = FakeTermii()
-    provider = SMSProvider(client=client)
+    provider = SMSProvider(
+        client=client,
+        redis_client=FakeSyncRedis(),
+    )
     notification = make_notification({"to": "2348012345678", "sms": "Hello"})
     notification.payload = '{"to": "2348012345678", "sms": "Hello"}'
 
@@ -96,9 +148,26 @@ def test_sms_provider_accepts_json_payload() -> None:
     assert client.messaging.payloads[0]["sms"] == "Hello"
 
 
+def test_sms_provider_skips_cached_notification() -> None:
+    redis = FakeSyncRedis()
+    client = FakeTermii()
+    provider = SMSProvider(client=client, redis_client=redis)
+    notification = make_notification(
+        {"to": "2348012345678", "sms": "Hello"}
+    )
+    redis.values[notification_cache_key(notification)] = (
+        PROCESSED_NOTIFICATION_VALUE
+    )
+
+    provider.process(notification)
+
+    assert client.messaging.payloads == []
+
+
 def test_sms_provider_wraps_termii_errors() -> None:
     client = FakeTermii(error=RuntimeError("Termii is unavailable"))
-    provider = SMSProvider(client=client)
+    redis = FakeSyncRedis()
+    provider = SMSProvider(client=client, redis_client=redis)
     notification = make_notification(
         {"to": "2348012345678", "sms": "Hello"}
     )
@@ -107,13 +176,15 @@ def test_sms_provider_wraps_termii_errors() -> None:
         provider.process(notification)
 
     assert isinstance(error.value.__cause__, RuntimeError)
+    assert redis.values == {}
 
 
 def test_sms_provider_rejects_termii_error_response() -> None:
     client = FakeTermii(
         response={"code": "error", "message": "Invalid sender ID"}
     )
-    provider = SMSProvider(client=client)
+    redis = FakeSyncRedis()
+    provider = SMSProvider(client=client, redis_client=redis)
     notification = make_notification(
         {"to": "2348012345678", "sms": "Hello"}
     )
@@ -121,10 +192,13 @@ def test_sms_provider_rejects_termii_error_response() -> None:
     with pytest.raises(ProviderServiceNotAvailableError, match="Invalid sender ID"):
         provider.process(notification)
 
+    assert redis.values == {}
+
 
 def test_sms_provider_rejects_invalid_payload() -> None:
     client = FakeTermii()
-    provider = SMSProvider(client=client)
+    redis = FakeSyncRedis()
+    provider = SMSProvider(client=client, redis_client=redis)
     notification = make_notification({"to": "2348012345678", "sms": "Hello"})
     notification.payload = "not-json"
 
@@ -132,3 +206,4 @@ def test_sms_provider_rejects_invalid_payload() -> None:
         provider.process(notification)
 
     assert client.messaging.payloads == []
+    assert redis.values == {}
