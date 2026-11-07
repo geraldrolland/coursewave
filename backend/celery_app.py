@@ -12,7 +12,23 @@ from app.base_config import get_settings
 TASK_QUEUE = "task"
 TASK_DLQ = "task.dlq"
 TASK_DLX = "task.dlx"
+TASK_RETRY = "task.retry"
 TASK_MAX_DELIVERIES = 5
+TASK_MAX_RETRIES = 5
+DLQ_MAX_RETRIES = 3
+TASK_RETRY_TTL_SECONDS = 300
+
+# RabbitMQ adds these headers when it dead-letters a message. Republishing a
+# message with stale death history can trigger the broker's cycle detection.
+DEATH_HEADERS = (
+    "x-death",
+    "x-first-death-exchange",
+    "x-first-death-queue",
+    "x-first-death-reason",
+    "x-last-death-exchange",
+    "x-last-death-queue",
+    "x-last-death-reason",
+)
 
 settings = get_settings()
 
@@ -45,6 +61,23 @@ task_queue = Queue(
     },
 )
 
+# The retry queue has no consumer. RabbitMQ holds each message for the TTL and
+# then dead-letters it back to the main task exchange.
+retry_queue = Queue(
+    TASK_RETRY,
+    exchange=dead_letter_exchange,
+    routing_key=TASK_RETRY,
+    durable=True,
+    queue_arguments={
+        "x-queue-type": "quorum",
+        "x-message-ttl": TASK_RETRY_TTL_SECONDS * 1000,
+        "x-dead-letter-exchange": TASK_QUEUE,
+        "x-dead-letter-routing-key": TASK_QUEUE,
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish",
+    },
+)
+
 celery_app = Celery(
     "coursewave",
     broker=settings.rabbitmq_url,
@@ -69,7 +102,7 @@ celery_app.conf.update(
     task_default_exchange_type="topic",
     task_default_routing_key=TASK_QUEUE,
     broker_native_delayed_delivery_queue_type="quorum",
-    task_queues=(dead_letter_queue, task_queue),
+    task_queues=(dead_letter_queue, task_queue, retry_queue),
     task_routes={
         "notification.process_notification": {
             "queue": TASK_QUEUE,
@@ -79,13 +112,12 @@ celery_app.conf.update(
 )
 
 
-@worker_init.connect
-def declare_queues(**_kwargs: Any) -> None:
-    """Declare every configured queue before the worker starts consuming.
+def declare_all_queues() -> None:
+    """Declare every configured queue and exchange.
 
     The worker consumes only ``task``, so Celery would not otherwise declare
-    ``task.dlq`` and RabbitMQ would drop dead-lettered messages that cannot be
-    routed.
+    ``task.dlq`` or ``task.retry``. The DLQ consumer uses this helper as well so
+    it can start before the worker without losing dead-lettered messages.
     """
 
     def declare() -> None:
@@ -101,6 +133,13 @@ def declare_queues(**_kwargs: Any) -> None:
         interval_step=1,
         max_retries=5,
     )
+
+
+@worker_init.connect
+def declare_queues(**_kwargs: Any) -> None:
+    """Declare the queue topology before the worker starts consuming."""
+
+    declare_all_queues()
 
 
 # ``celery -A celery_app`` discovers the app through this conventional name.

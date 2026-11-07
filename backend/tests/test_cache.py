@@ -23,6 +23,7 @@ CACHE_PREFIX = "/student/api/v1"
 CACHE_HEALTH_PATH = f"{CACHE_PREFIX}/health"
 CACHE_TEST_PATH_NAMES = (
     "/health",
+    "/headers",
     "/no-store",
     "/private",
     "/vary",
@@ -84,7 +85,7 @@ def test_public_get_is_cached_for_420_seconds() -> None:
     assert second.status_code == 200
     assert second.headers["x-cache"] == "HIT"
     assert second.json() == {"status": "ok"}
-    assert f"cache:{CACHE_HEALTH_PATH}" in redis.values
+    assert redis.values[f"cache:{CACHE_HEALTH_PATH}"] == b'{"status":"ok"}'
     assert redis.ttls[f"cache:{CACHE_HEALTH_PATH}"] == 420
 
 
@@ -207,6 +208,7 @@ def test_json_with_charset_is_cached() -> None:
     assert first.status_code == 200
     assert first.headers["x-cache"] == "MISS"
     assert second.headers["x-cache"] == "HIT"
+    assert second.headers["content-type"] == "application/json"
     assert second.json() == {"ok": True}
     assert f"cache:{path}" in redis.values
 
@@ -363,13 +365,13 @@ def test_uncacheable_responses_are_not_stored(
     assert f"cache:{path}" not in redis.values
 
 
-def test_large_response_is_not_cached() -> None:
+def test_large_json_response_is_not_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
     path = f"{CACHE_PREFIX}/large"
 
     def configure(app: FastAPI) -> None:
-        async def large() -> PlainTextResponse:
-            return PlainTextResponse("x" * (MAX_CACHE_BODY_BYTES + 1))
+        async def large() -> JSONResponse:
+            return JSONResponse({"data": "x" * (MAX_CACHE_BODY_BYTES + 1)})
 
         app.add_api_route(path, large, methods=["GET"])
 
@@ -378,9 +380,44 @@ def test_large_response_is_not_cached() -> None:
         second = client.get(path)
 
     assert first.status_code == 200
-    assert len(first.content) == MAX_CACHE_BODY_BYTES + 1
+    assert len(first.content) > MAX_CACHE_BODY_BYTES
     assert second.headers["x-cache"] == "MISS"
     assert f"cache:{path}" not in redis.values
+
+
+def test_cache_hit_does_not_replay_response_headers() -> None:
+    settings = build_settings(**TEST_CACHE_SETTINGS)
+    path = f"{CACHE_PREFIX}/headers"
+
+    def configure(app: FastAPI) -> None:
+        async def headers() -> JSONResponse:
+            return JSONResponse(
+                {"ok": True},
+                headers={
+                    "Cache-Control": "public, max-age=60",
+                    "ETag": '"original"',
+                    "X-Custom": "not-cached",
+                },
+            )
+
+        app.add_api_route(path, headers, methods=["GET"])
+
+    with cache_client(settings, configure) as (client, redis):
+        first = client.get(path)
+        second = client.get(path)
+
+    assert first.status_code == 200
+    assert first.headers["x-custom"] == "not-cached"
+    assert first.headers["etag"] == '"original"'
+
+    assert second.status_code == 200
+    assert second.headers["x-cache"] == "HIT"
+    assert second.headers["content-type"] == "application/json"
+    assert second.headers["content-length"] == "11"
+    assert "x-custom" not in second.headers
+    assert "etag" not in second.headers
+    assert "cache-control" not in second.headers
+    assert redis.values[f"cache:{path}"] == b'{"ok":true}'
 
 
 def test_cache_hit_does_not_reuse_cors_headers() -> None:
@@ -448,7 +485,7 @@ def test_streaming_response_is_not_cached() -> None:
     assert f"cache:{path}" not in redis.values
 
 
-def test_multi_chunk_json_stream_is_not_cached() -> None:
+def test_multi_chunk_json_stream_is_cached() -> None:
     settings = build_settings(**TEST_CACHE_SETTINGS)
     path = f"{CACHE_PREFIX}/json-stream"
 
@@ -474,8 +511,8 @@ def test_multi_chunk_json_stream_is_not_cached() -> None:
     assert first.headers["x-cache"] == "MISS"
     assert second.status_code == 200
     assert second.content == b'{"ok":true}'
-    assert second.headers["x-cache"] == "MISS"
-    assert f"cache:{path}" not in redis.values
+    assert second.headers["x-cache"] == "HIT"
+    assert redis.values[f"cache:{path}"] == b'{"ok":true}'
 
 
 def test_redis_read_failure_fails_open() -> None:

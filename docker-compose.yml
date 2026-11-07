@@ -159,6 +159,25 @@ services:
     networks:
       - coursewave
 
+  dlq-consumer:
+    image: coursewave-backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - dlq.consumer
+    environment: *backend-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - coursewave
+
 volumes:
   redis_data:
   postgres_data:

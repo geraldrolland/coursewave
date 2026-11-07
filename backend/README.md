@@ -18,6 +18,8 @@ directly.
 - `EMAIL` and `GOOGLE` authentication methods with nullable password hashes.
 - Asynchronous notification processing through Celery, RabbitMQ quorum queues,
   and Redis locks.
+- A DLQ consumer that retries failed notifications through a TTL queue and
+  marks them failed after the retry budget is exhausted.
 - Jinja-rendered email templates for OTP and email verification messages.
 - SendGrid email, Kafka push, and Termii SMS delivery through a provider
   registry.
@@ -82,6 +84,10 @@ backend/
 │           ├── router/
 │           └── schema/
 ├── celery_app.py
+├── dlq/
+│   ├── __init__.py
+│   ├── consumer.py
+│   └── handlers.py
 ├── templates/
 │   └── email/
 │       ├── email_verification/
@@ -168,6 +174,13 @@ RabbitMQ are available:
 .venv\Scripts\celery.exe -A celery_app worker --loglevel=INFO --queues=task
 ```
 
+Start the DLQ consumer in a third terminal after PostgreSQL and RabbitMQ are
+available:
+
+```powershell
+.venv\Scripts\python -m dlq.consumer
+```
+
 ### Docker Compose
 
 ```powershell
@@ -176,10 +189,11 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Compose starts five services:
+Compose starts six services:
 
 - `coursewave` - this API, published on `http://localhost:3000`
 - `worker` - the Celery worker consuming the `task` queue
+- `dlq-consumer` - the DLQ consumer that retries and finalizes failed tasks
 - `postgres` - PostgreSQL with the `coursewave_db` database
 - `redis` - sessions, cache, rate-limit counters, verification tokens, and
   notification locks
@@ -281,6 +295,9 @@ receive an `X-Cache` header. Prefixes match complete path segments, so
 
 - Cache key: `cache:<path>` plus the raw query string when present.
 - TTL: `CACHE_TTL_SECONDS` (420 seconds by default).
+- Only the response body is stored in Redis; response headers are not cached.
+  Cache hits return `application/json` with a regenerated `Content-Length` and
+  `X-Cache: HIT`.
 - Only responses whose media type is exactly `application/json` are cached.
   Parameters such as `application/json; charset=utf-8` are allowed, but
   `application/problem+json` and other non-JSON media types are not cached.
@@ -288,7 +305,10 @@ receive an `X-Cache` header. Prefixes match complete path segments, so
   and still receive `X-Cache: MISS`.
 - Responses are cached only when they are `200` and have no `Set-Cookie`,
   `Cache-Control: no-store`/`private`, or `Vary: *`.
-- Streaming responses and bodies over 1 MiB are not cached.
+- JSON bodies over 1 MiB are not cached. Chunked JSON responses under that limit
+  are fully buffered and cached.
+- Cacheable JSON responses are fully buffered before being returned, including
+  bodies over 1 MiB.
 - Redis failures fail open and never break the request.
 - The `X-Cache` header is `HIT` or `MISS` on cache-routed responses.
 
@@ -580,15 +600,19 @@ The task resolves the provider using
 
 1. Acquires the Redis lock `notification:process:<id>` with a 120-second TTL.
 2. If the lock is held, retries with the same 120-second lock TTL as its
-   countdown.
+   countdown and preserves the custom `x-retries` header.
 3. Loads the notification.
-4. Returns if the status is already `processed`.
+4. Returns if the status is not `pending`, so `processed` and `failed`
+   notifications are never delivered again.
 5. Resolves the notification provider and calls `provider.process(notification)`.
 6. On success, marks the notification `processed`.
-7. On `NotificationError`, retries with 10 seconds of exponential backoff and
-   jitter (`max_retries=5`). After the final attempt it marks the notification
-   `failed` and rejects the message without requeue so RabbitMQ routes it to
-   `task.dlq`.
+7. On `NotificationError`, rejects the message with `requeue=True`. The
+   notification stays `pending`; RabbitMQ redelivers the task until the
+   `task` delivery limit is exhausted, then dead-letters it to `task.dlq`.
+
+`max_retries=5` and `default_retry_delay=10` now apply only to lock contention.
+They do not limit provider failures, because provider failures use the broker
+delivery limit and the DLQ retry budget instead.
 
 The process lock is released in a `finally` block, including when a retry or
 reject is raised.
@@ -597,18 +621,53 @@ reject is raised.
 
 - `task` - main quorum queue with `x-delivery-limit=5`; dead-letters to
   `task.dlx` with routing key `task.dlq`.
-- `task.dlq` - quorum dead-letter queue with no delivery limit. The worker does
-  not consume it.
-- Both exchanges are topic exchanges, so Celery can use RabbitMQ native delayed
+- `task.dlq` - quorum dead-letter queue with no delivery limit. It is consumed
+  by `dlq-consumer`.
+- `task.retry` - quorum delay queue with no consumer,
+  `x-message-ttl=300000`, and `x-dead-letter-strategy=at-least-once`. After five
+  minutes it dead-letters messages back to the `task` exchange.
+- All exchanges are topic exchanges. Celery can use RabbitMQ native delayed
   delivery for retry countdowns instead of holding messages in a worker.
 - `task_acks_late=True`, `task_reject_on_worker_lost=True`, and
   `task_acks_on_failure_or_timeout=False` make worker crashes requeue messages
   so the delivery limit eventually moves poison messages to the DLQ.
-- The worker declares both queues before consuming and only consumes `task`:
+- The worker declares all three queues before consuming and only consumes
+  `task`:
 
   ```powershell
   .venv\Scripts\celery.exe -A celery_app worker --loglevel=INFO --queues=task
   ```
+
+### DLQ consumer
+
+`python -m dlq.consumer` consumes `task.dlq` and uses the custom `x-retries`
+header:
+
+1. First DLQ delivery (header missing): set `x-retries=1`, republish to
+   `task.retry`, then acknowledge.
+2. Header present and `x-retries + 1 < 3`: increment `x-retries`, republish to
+   `task.retry`, then acknowledge.
+3. Header present and `x-retries + 1 >= 3`: call the terminal handler
+   `mark_notif_failed(notification_id)`, then acknowledge. The handler takes a
+   row lock and changes only `pending` notifications to `failed`;
+   `processed` and `failed` notifications are left unchanged.
+
+Republishing strips RabbitMQ death headers (`x-death` and the
+`x-first-death-*`/`x-last-death-*` headers), clears `eta`/`expires`, resets
+Celery's `retries` header to `0`, and preserves `x-retries`. This avoids
+RabbitMQ cycle detection and resets the per-cycle delivery count.
+
+The final failure normally happens on the third DLQ arrival, after two real
+five-minute waits in `task.retry`. Within each cycle the task is redelivered up
+to `x-delivery-limit=5` times before RabbitMQ dead-letters it, so a terminal
+notification can take roughly ten minutes to reach `failed`.
+
+Unknown task names, malformed bodies, invalid retry headers, invalid
+notification IDs, and arguments that do not match the handler are logged and
+acknowledged as poison messages. Handler, database, and publish failures are
+logged, throttled for five seconds, and rejected with `requeue=True`. The
+consumer enables publisher confirms and acknowledges only after the retry
+publish succeeds or the terminal handler commits.
 
 There is no enqueue endpoint or scheduler yet. Another component must insert a
 `Notification` row and submit `notification.process_notification` with its ID.
@@ -633,11 +692,11 @@ The suite covers authentication, CORS, caching, rate limiting, refresh-token
 rotation, request logging, PostgreSQL configuration, session cleanup,
 registration validation, password hashing, Redis token creation,
 duplicate-email handling, student auth-method defaults, notification model
-defaults, Celery queue topology, lock handling, retry behavior, final failure
-handling, provider dispatch, email template rendering, SendGrid error handling,
-Kafka producer publishing, Kafka consumer dispatch and commits, Termii SMS
-delivery, WebSocket authentication and connection management, and
-processed-notification caching.
+defaults, Celery queue topology, lock handling, retry behavior, DLQ republish
+and terminal failure handling, provider dispatch, email template rendering,
+SendGrid error handling, Kafka producer publishing, Kafka consumer dispatch and
+commits, Termii SMS delivery, WebSocket authentication and connection
+management, and processed-notification caching.
 
 ## Known Limitations
 

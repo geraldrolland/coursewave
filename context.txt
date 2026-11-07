@@ -37,8 +37,13 @@ Caching
 - Public, cookie-free, non-authenticated 200 GET responses only.
 - Cache key: cache:<path> plus ?<raw query string> when present.
 - TTL: CACHE_TTL_SECONDS (420 seconds by default).
-- Do not cache Set-Cookie, Cache-Control: no-store/private, Vary: *, streaming
-  responses, or bodies over 1 MiB.
+- Only the response body is stored; response headers are never cached. Cache
+  hits generate Content-Type: application/json, Content-Length, and X-Cache.
+- Do not cache Set-Cookie, Cache-Control: no-store/private, or Vary: *.
+- JSON bodies over 1 MiB are not cached. Chunked JSON responses under that
+  limit are fully buffered and cached.
+- Cacheable JSON responses are fully buffered before being returned, including
+  oversized bodies.
 - Redis failures fail open.
 
 Rate limiting
@@ -89,12 +94,11 @@ Notifications and Celery
 - Task name: notification.process_notification. Task options:
     max_retries=5
     default_retry_delay=10
-    retry_backoff=10
-    retry_jitter=True
-    autoretry_for=(NotificationError,)
     acks_late=True
     reject_on_worker_lost=True
     acks_on_failure_or_timeout=False
+- The task no longer sets autoretry_for, retry_backoff, or retry_jitter.
+  max_retries/default_retry_delay are used only for Redis lock contention.
 - Global worker settings also set acks_late, reject_on_worker_lost,
   acks_on_failure_or_timeout=False, and worker_prefetch_multiplier=1.
 - process_notification takes notification_id and runs its async database/Redis
@@ -102,33 +106,74 @@ Notifications and Celery
   cleared after each task.
 - Task flow:
     1. Acquire Redis process lock notification:process:<id>, TTL 120 seconds.
-    2. If busy, retry with countdown=120 seconds (the lock TTL).
+    2. If busy, retry with countdown=120 seconds (the lock TTL) and preserve
+       custom headers such as x-retries while stripping RabbitMQ death headers
+       and eta/expires.
     3. Load the notification.
-    4. Return if status is already processed.
+    4. Return if status is not pending (processed and failed are both skipped).
     5. Resolve the provider from notification.type and call
        provider.process(notification).
     6. Success: set status=processed and commit.
-    7. NotificationError before the last attempt: re-raise so Celery autoretries
-       with exponential backoff and jitter.
-    8. NotificationError on the last attempt: set status=failed, commit, then
-       raise Reject(requeue=False) from the original error.
+    7. NotificationError: log, leave the status pending, and raise
+       Reject(requeue=True) so RabbitMQ consumes the task delivery limit and
+       then dead-letters the message to task.dlq.
 - There is no commit lock. The process lock is released in a finally block on
   success, retry, or reject.
 - Queue topology:
     task: quorum queue, x-delivery-limit=5, dead-letter exchange task.dlx,
           dead-letter routing key task.dlq
-    task.dlq: quorum queue, x-delivery-limit=-1
+    task.dlq: quorum queue, x-delivery-limit=-1, consumed by dlq-consumer
+    task.retry: quorum queue, no consumer, x-message-ttl=300000,
+                dead-letter exchange task, dead-letter routing key task,
+                x-dead-letter-strategy=at-least-once,
+                x-overflow=reject-publish
 - Exchanges are topic exchanges so Celery uses RabbitMQ native delayed delivery
   for retry countdowns. Celery 5.5+ is required; the installed version is
-  5.6.3.
+  5.7.0.
 - broker_native_delayed_delivery_queue_type is explicitly "quorum".
 - The worker declares all configured queues on the worker_init signal because
-  it consumes only `task` and would otherwise not declare task.dlq. The worker
-  command is:
+  it consumes only `task` and would otherwise not declare task.dlq or
+  task.retry. The worker command is:
     celery -A celery_app worker --loglevel=INFO --queues=task
 - A worker service using the backend image and shared environment anchor was
   added to docker-compose.yml. It waits for Redis, PostgreSQL, and RabbitMQ to
   become healthy.
+- A dlq-consumer service runs `python -m dlq.consumer` from the same image and
+  waits for PostgreSQL and RabbitMQ.
+
+DLQ Consumer
+- Package: backend/dlq with __init__.py, consumer.py, and handlers.py.
+- TASK_RETRY = "task.retry", DLQ_MAX_RETRIES = 3, and
+  TASK_RETRY_TTL_SECONDS = 300 live in celery_app.py.
+- The consumer uses Kombu (already installed with Celery), not pika.
+- It consumes task.dlq with prefetch_count=1 and publisher confirms enabled via
+  transport_options={"confirm_publish": True}.
+- DLQ retry budget:
+    missing x-retries -> publish to task.retry with x-retries=1, then ack
+    x-retries + 1 < 3 -> publish with x-retries + 1, then ack
+    x-retries + 1 >= 3 -> run the terminal handler, then ack
+  With DLQ_MAX_RETRIES=3 the terminal handler normally runs on the third DLQ
+  arrival after two real five-minute retries.
+- Republishing preserves the task body and custom headers, strips x-death and
+  x-first-death-*/x-last-death-*, removes eta/expires, resets Celery's retries
+  header to 0, sets x-retries, and publishes JSON with delivery_mode=2.
+- Handler map:
+    notification.process_notification -> mark_notif_failed
+    process_notification -> mark_notif_failed
+- Handler arguments are normalized with inspect.signature(handler).bind(*args,
+  **kwargs) and invoked as handler(**bound.arguments). Async handlers are
+  awaited.
+- mark_notif_failed(notification_id) parses the UUID, uses a PostgreSQL row lock
+  (with_for_update=True), leaves PROCESSED untouched, treats FAILED as
+  idempotent, and changes PENDING to FAILED.
+- Poison handling: unknown task names, malformed bodies, invalid x-retries,
+  invalid notification IDs, and handler signature mismatches are logged and
+  acked.
+- Handler/database/publish failures are logged, throttled for 5 seconds, and
+  rejected with requeue=True.
+- The consumer acknowledges only after the retry publish is confirmed or the
+  terminal handler succeeds. Duplicates remain acceptable under
+  at-least-once delivery; the task and handler are idempotent.
 
 Email Templates
 - New service at
@@ -253,7 +298,8 @@ Completed
 - Added the rate-limiter registry, async handler functions, and BaseHTTPMiddleware
   conversions for Auth, Cache, RateLimit, RefreshToken, and RequestLogger.
 - Added the CACHE_ROUTES allowlist, JSON-only cache storage, and the related
-  tests.
+  tests. The cache now stores only the response body; response headers are not
+  persisted and cache hits regenerate Content-Type, Content-Length, and X-Cache.
 - Added AuthMethod, nullable password_hash, and removed the Outbox model and
   registration-side outbox writes.
 - Created the notification service, Notification model, NotificationError, and
@@ -298,16 +344,28 @@ Completed
   FastAPI app.
 - Replaced the deprecated httpx TestClient dependency with httpx2 and added
   targeted pytest filters for kafka-python's importlib.resources warnings.
-- Updated backend/README.md, README.md, and this context file.
+- Added the task.retry queue, DLQ_MAX_RETRIES/TASK_RETRY_TTL_SECONDS constants,
+  shared DEATH_HEADERS, and the declare_all_queues helper to celery_app.py.
+- Changed process_notification to reject provider failures with
+  Reject(requeue=True), skip every non-pending status, and preserve custom
+  headers on lock-contention retries.
+- Added the dlq package with the Kombu consumer, retry republishing, poison
+  handling, handler binding, and mark_notif_failed.
+- Added the dlq copy to the Dockerfile and the dlq-consumer Compose service.
+- Added tests/test_dlq.py and updated test_notification.py for the new task and
+  queue behavior.
+- Updated README.md, backend/README.md, and this context file.
 
 Active
 - None.
 
 Blocked
-- None.
+- RabbitMQ is not reachable on localhost:5672 in this environment, and no
+  Docker CLI, RabbitMQ binary, or Erlang service is installed, so live
+  end-to-end DLQ delivery could not be exercised.
 
 Next Move
-- None. The template and provider implementation is complete and validated.
+- None. The DLQ implementation is complete and validated with unit tests.
 
 
 Known Gaps
@@ -329,7 +387,7 @@ Known Gaps
 
 Validation Results
 ------------------
-- pytest -q: 180 passed, no warnings.
+- pytest -q: 224 passed, no warnings.
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -349,10 +407,18 @@ Validation Results
     task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
     task: topic exchange task, quorum, x-delivery-limit=5, DLX task.dlx,
           routing key task.dlq
+    task.retry: topic exchange task.dlx, quorum, x-message-ttl=300000,
+                DLX task/task, at-least-once, x-overflow=reject-publish
 - celery_app.conf.task_default_exchange_type is "topic" and
   broker_native_delayed_delivery_queue_type is "quorum".
-- docker compose config --quiet: passed.
-- Compose services: coursewave, worker, postgres, redis, rabbitmq.
+- DLQ tests cover parsing, retry budget, death-header stripping, confirmed
+  republishing, poison acks, throttled requeues, handler binding, and
+  mark_notif_failed state transitions.
+- docker compose config could not be run because the Docker CLI is not
+  installed. The Compose YAML was parsed with PyYAML and contains:
+  coursewave, worker, dlq-consumer, postgres, redis, rabbitmq.
+- RabbitMQ was unreachable on localhost:5672 and no broker binary is
+  installed, so live DLQ delivery was not exercised.
 - No containers or Docker Desktop were started.
 
 
@@ -434,7 +500,8 @@ Relevant Files
 - backend/app/services/notification/ws/websocket_notif_manager.py
   WebsocketNotificationManager, connection registry, and active-socket sends.
 - backend/app/services/notification/task/process_notification.py
-  process_notification task, lock flow, retry handling, and final Reject.
+  process_notification task, lock flow, custom-header preservation, pending-only
+  processing, and Reject(requeue=True) on provider failure.
 - backend/app/services/notification/task/__init__.py
   Exports the process_notification task.
 - backend/app/services/notification/template_manager/__init__.py
@@ -466,12 +533,24 @@ Relevant Files
 - backend/tests/test_ws_manager.py
   WebSocket registration, removal, active-only sends, and stale socket cleanup.
 - backend/celery_app.py
-  Celery app, queue/DLX/DLQ declarations, retry and ack settings, task route,
-  and the worker_init queue declaration.
+  Celery app, queue/DLX/DLQ/retry declarations, shared DEATH_HEADERS, retry and
+  ack settings, task route, declare_all_queues, and the worker_init declaration.
+- backend/dlq/__init__.py
+  Dead-letter queue package marker.
+- backend/dlq/consumer.py
+  Kombu task.dlq consumer, x-retries budget, retry republishing with confirmed
+  publishes, poison handling, throttled requeues, and standalone main().
+- backend/dlq/handlers.py
+  Handler map, signature binding contract, InvalidNotificationId, and
+  mark_notif_failed with a PostgreSQL row lock.
 - backend/tests/fakes.py
   Async FakeRedis and FakeLock test doubles with failure injection.
 - backend/tests/test_notification.py
-  Model, queue topology, worker declaration, lock, retry, and failure tests.
+  Model, queue topology, worker declaration, lock, header preservation, and
+  requeue failure tests.
+- backend/tests/test_dlq.py
+  DLQ parsing, retry budget, republishing, poison handling, throttled
+  requeues, handler binding, and mark_notif_failed state tests.
 - backend/requirements.txt
   FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, SendGrid, kafka-python,
   termii-client, and auth dependencies.
@@ -480,11 +559,12 @@ Relevant Files
 - backend/pytest.ini
   Targeted filters for kafka-python importlib.resources deprecation warnings.
 - backend/Dockerfile
-  Installs requirements, copies app, templates, and celery_app.py, and runs
+  Installs requirements, copies app, templates, celery_app.py, and dlq, and runs
   uvicorn.
 - docker-compose.yml
-  coursewave, worker, postgres, redis, and rabbitmq; shared backend environment
-  with SendGrid, Kafka producer/consumer, and Termii placeholders.
+  coursewave, worker, dlq-consumer, postgres, redis, and rabbitmq; shared
+  backend environment with SendGrid, Kafka producer/consumer, and Termii
+  placeholders.
 - backend/README.md and README.md
   Architecture, middleware, auth, cache, rate-limit, notification, provider,
   WebSocket, Celery, Kafka, Termii, and testing documentation.
@@ -511,8 +591,11 @@ Important Context
 - Notification enums store lowercase values; Notification.status defaults to
   pending.
 - Notification process lock key: notification:process:<id>, with a 120-second
-  TTL. A busy lock retries after the same 120-second TTL. There is no commit
-  lock.
+  TTL. A busy lock retries after the same 120-second TTL and preserves custom
+  headers (notably x-retries). There is no commit lock.
+- The task skips every status other than pending. Provider failures raise
+  Reject(requeue=True) and leave the status pending; the DLQ consumer is the
+  only component that marks a notification failed.
 - TemplateManager accepts `otp` or `email_verification` as either a string or
   TemplateType. Email verification templates use the `link` content key; OTP
   templates use `otp`. Rendered templates expose body, version_number, and
@@ -542,13 +625,21 @@ Important Context
 - Processed notification cache key:
   notification:processed:<type>:<notification_id>; value "processed"; TTL 240
   seconds. Cache errors fail open.
-- Retry countdowns use retry_backoff=10 with full jitter, so the nominal delays
-  are 10, 20, 40, 80, and 160 seconds, capped at 600 seconds.
-- Celery self.retry publishes a new message, so RabbitMQ x-delivery-limit=5
-  covers broker redeliveries (worker crashes/requeues), not application
-  retries. The final Reject(requeue=False) sends exhausted application failures
-  to task.dlq immediately.
-- The worker consumes only task; task.dlq is not consumed.
+- DLQ retry budget: missing x-retries republishes with 1; otherwise terminal
+  only when x-retries + 1 >= 3. With DLQ_MAX_RETRIES=3 the handler normally runs
+  on the third DLQ arrival after two real five-minute waits.
+- Republishing to task.retry strips x-death and x-first-death-*/x-last-death-*,
+  clears eta/expires, resets retries=0, preserves x-retries, and publishes JSON
+  with delivery_mode=2. This avoids RabbitMQ cycle detection.
+- Celery self.retry publishes a new message and resets RabbitMQ delivery counts.
+  It is now used only for lock-contention retries; provider failures use
+  Reject(requeue=True) and x-delivery-limit=5.
+- The worker consumes only task. The dlq-consumer consumes only task.dlq, and
+  task.retry has no consumer.
+- The terminal handler mark_notif_failed uses a row lock, leaves processed
+  notifications untouched, treats failed as idempotent, and changes pending to
+  failed. Poison DLQ messages are acked; handler/DB/publish failures are
+  throttled for 5 seconds and rejected with requeue=True.
 - Compose service publishes host port 3000 to container port 8000.
 - Registration remains public at /student/api/v1/register.
 - All new error responses use {"detail": "..."}.

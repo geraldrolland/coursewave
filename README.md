@@ -1,7 +1,7 @@
 # CourseWave
 
 CourseWave is a student platform built around a FastAPI backend, PostgreSQL,
-Redis, RabbitMQ, and a Celery worker for asynchronous notification delivery.
+Redis, RabbitMQ, and Celery workers for asynchronous notification delivery.
 Kafka is used for push notification fan-out and authenticated WebSocket
 delivery through an external broker.
 
@@ -11,6 +11,7 @@ delivery through an external broker.
 |---------|-------------|------|
 | `coursewave` | FastAPI backend | `3000` |
 | `worker` | Celery worker for notification tasks | - |
+| `dlq-consumer` | Retries dead-lettered tasks and marks exhausted notifications failed | - |
 | `postgres` | PostgreSQL 17 with `coursewave_db` | `5432` |
 | `redis` | Sessions, cache, rate limits, verification tokens, notification locks | `6379` |
 | `rabbitmq` | Task broker with quorum queues and a dead-letter queue | `5672`, `15672` |

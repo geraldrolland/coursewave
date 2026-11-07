@@ -18,11 +18,22 @@ from app.redis_config import create_redis_client
 from app.services.notification.exception import NotificationError
 from app.services.notification.model import Notification, NotificationStatus
 from app.services.notification.provider import ProviderManager
-from celery_app import celery_app
+from celery_app import DEATH_HEADERS, TASK_MAX_RETRIES, celery_app
 
 logger = logging.getLogger("notification_service.task.process_notification")
 
 NOTIFICATION_LOCK_TTL_SECONDS = 120
+
+
+def _preserved_headers(task: Task) -> dict[str, Any]:
+    """Return custom headers that must survive a lock-contention retry."""
+
+    headers = dict(getattr(task.request, "headers", None) or {})
+    for name in DEATH_HEADERS:
+        headers.pop(name, None)
+    headers.pop("eta", None)
+    headers.pop("expires", None)
+    return headers
 
 
 async def _release_lock(lock: Any) -> None:
@@ -55,7 +66,10 @@ async def _process_notification(
             notification_id,
             NOTIFICATION_LOCK_TTL_SECONDS,
         )
-        raise task.retry(countdown=NOTIFICATION_LOCK_TTL_SECONDS)
+        raise task.retry(
+            countdown=NOTIFICATION_LOCK_TTL_SECONDS,
+            headers=_preserved_headers(task),
+        )
 
     try:
         async with session_factory() as session:
@@ -64,31 +78,25 @@ async def _process_notification(
                 logger.warning("Notification %s does not exist", notification_id)
                 return
 
-            if notification.status == NotificationStatus.PROCESSED:
-                logger.info("Notification %s is already processed", notification_id)
+            if notification.status != NotificationStatus.PENDING:
+                logger.info(
+                    "Notification %s is already %s",
+                    notification_id,
+                    notification.status.value,
+                )
                 return
 
             try:
                 provider = ProviderManager.get_provider(notification.type)
                 provider.process(notification)
             except NotificationError as exc:
-                if task.request.retries >= task.max_retries:
-                    notification.status = NotificationStatus.FAILED
-                    await session.commit()
-                    logger.error(
-                        "Notification %s failed after %s retries",
-                        notification_id,
-                        task.request.retries,
-                    )
-                    raise Reject(str(exc), requeue=False) from exc
-
-                logger.info(
-                    "Notification %s failed; retry %s of %s",
+                logger.warning(
+                    "Notification %s delivery failed; rejecting so RabbitMQ "
+                    "requeues it for the DLQ: %s",
                     notification_id,
-                    task.request.retries + 1,
-                    task.max_retries,
+                    exc,
                 )
-                raise
+                raise Reject(str(exc), requeue=True) from exc
 
             notification.status = NotificationStatus.PROCESSED
             await session.commit()
@@ -100,11 +108,8 @@ async def _process_notification(
 @celery_app.task(
     bind=True,
     name="notification.process_notification",
-    max_retries=5,
+    max_retries=TASK_MAX_RETRIES,
     default_retry_delay=10,
-    retry_backoff=10,
-    retry_jitter=True,
-    autoretry_for=(NotificationError,),
     acks_late=True,
     reject_on_worker_lost=True,
     acks_on_failure_or_timeout=False,

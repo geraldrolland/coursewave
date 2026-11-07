@@ -1,17 +1,13 @@
 """BaseHTTPMiddleware that caches public GET responses in Redis."""
 
-import base64
-import json
 import logging
-from collections.abc import AsyncIterator, Callable
-from typing import Any
+from collections.abc import Callable
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import Response
 from starlette.types import ASGIApp, Scope
 
 from app.base_config import Settings, split_csv
@@ -23,28 +19,6 @@ MAX_CACHE_BODY_BYTES = 1024 * 1024
 CACHE_ROUTES = (
     "/student/api/v1",
     "/instructor/api/v1",
-)
-EXCLUDED_RESPONSE_HEADERS = frozenset(
-    {
-        b"access-control-allow-credentials",
-        b"access-control-allow-headers",
-        b"access-control-allow-methods",
-        b"access-control-allow-origin",
-        b"access-control-expose-headers",
-        b"access-control-max-age",
-        b"connection",
-        b"content-length",
-        b"keep-alive",
-        b"retry-after",
-        b"transfer-encoding",
-        b"upgrade",
-        b"vary",
-        b"x-cache",
-        b"x-ratelimit-limit",
-        b"x-ratelimit-remaining",
-        b"x-ratelimit-reset",
-        b"x-request-id",
-    }
 )
 
 
@@ -109,9 +83,9 @@ class CacheMiddleware(BaseHTTPMiddleware):
         cache_key = self._cache_key(request.scope)
         redis = self.redis_provider()
 
-        cached_response = await self._read_cache(redis, cache_key)
-        if cached_response is not None:
-            return self._cached_response(*cached_response)
+        cached_body = await self._read_cache(redis, cache_key)
+        if cached_body is not None:
+            return self._cached_response(cached_body)
 
         response = await call_next(request)
         response.headers["X-Cache"] = "MISS"
@@ -155,7 +129,7 @@ class CacheMiddleware(BaseHTTPMiddleware):
         self,
         redis: Redis,
         cache_key: str,
-    ) -> tuple[int, list[tuple[bytes, bytes]], bytes] | None:
+    ) -> bytes | None:
         try:
             raw = await redis.get(cache_key)
         except RedisError:
@@ -164,44 +138,18 @@ class CacheMiddleware(BaseHTTPMiddleware):
 
         if raw is None:
             return None
-
-        try:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            payload: dict[str, Any] = json.loads(raw)
-            status = int(payload["status"])
-            stored_headers = payload["headers"]
-            body = base64.b64decode(payload["body"])
-        except (KeyError, TypeError, ValueError):
-            logger.warning("Ignoring malformed cached response for %s", cache_key)
-            return None
-
-        headers: list[tuple[bytes, bytes]] = []
-        for name, value in stored_headers:
-            encoded_name = str(name).encode("latin-1").lower()
-            if encoded_name in EXCLUDED_RESPONSE_HEADERS:
-                continue
-            headers.append(
-                (str(name).encode("latin-1"), str(value).encode("latin-1"))
-            )
-
-        if not _is_json_content_type(Headers(raw=headers).get("content-type")):
-            logger.warning("Ignoring non-JSON cached response for %s", cache_key)
-            return None
-
-        headers.append((b"x-cache", b"HIT"))
-        headers.append((b"content-length", str(len(body)).encode("latin-1")))
-        return status, headers, body
+        if isinstance(raw, str):
+            return raw.encode("utf-8")
+        return raw
 
     @staticmethod
-    def _cached_response(
-        status: int,
-        headers: list[tuple[bytes, bytes]],
-        body: bytes,
-    ) -> Response:
-        response = Response(content=body, status_code=status)
-        response.raw_headers = headers
-        return response
+    def _cached_response(body: bytes) -> Response:
+        return Response(
+            content=body,
+            status_code=200,
+            media_type="application/json",
+            headers={"X-Cache": "HIT"},
+        )
 
     async def _forward_and_store(
         self,
@@ -209,62 +157,18 @@ class CacheMiddleware(BaseHTTPMiddleware):
         redis: Redis,
         cache_key: str,
     ) -> Response:
-        body_iterator = response.body_iterator
-        first_chunk = await self._next_chunk(body_iterator)
+        body = b"".join([chunk async for chunk in response.body_iterator])
 
-        if first_chunk is None:
-            await self._store_response(redis, cache_key, response, b"")
-            return self._buffered_response(response, b"")
+        if len(body) <= MAX_CACHE_BODY_BYTES:
+            await self._store_response(redis, cache_key, response, body)
 
-        if len(first_chunk) > MAX_CACHE_BODY_BYTES:
-            return self._stream_response(
-                response,
-                [first_chunk],
-                body_iterator,
-            )
-
-        second_chunk = await self._next_chunk(body_iterator)
-        if second_chunk is not None:
-            return self._stream_response(
-                response,
-                [first_chunk, second_chunk],
-                body_iterator,
-            )
-
-        await self._store_response(redis, cache_key, response, first_chunk)
-        return self._buffered_response(response, first_chunk)
-
-    @staticmethod
-    async def _next_chunk(body_iterator: AsyncIterator[bytes]) -> bytes | None:
-        try:
-            return await body_iterator.__anext__()
-        except StopAsyncIteration:
-            return None
+        return self._buffered_response(response, body)
 
     @staticmethod
     def _buffered_response(response: Response, body: bytes) -> Response:
         buffered = Response(content=body, status_code=response.status_code)
         buffered.raw_headers = list(response.headers.raw)
         return buffered
-
-    @staticmethod
-    def _stream_response(
-        response: Response,
-        buffered_chunks: list[bytes],
-        body_iterator: AsyncIterator[bytes],
-    ) -> StreamingResponse:
-        async def stream_body() -> AsyncIterator[bytes]:
-            for chunk in buffered_chunks:
-                yield chunk
-            async for chunk in body_iterator:
-                yield chunk
-
-        streaming = StreamingResponse(
-            stream_body(),
-            status_code=response.status_code,
-        )
-        streaming.raw_headers = list(response.headers.raw)
-        return streaming
 
     async def _store_response(
         self,
@@ -276,20 +180,7 @@ class CacheMiddleware(BaseHTTPMiddleware):
         if not self._is_cacheable_response(response):
             return
 
-        stored_headers = [
-            [name.decode("latin-1"), value.decode("latin-1")]
-            for name, value in response.headers.raw
-            if name.lower() not in EXCLUDED_RESPONSE_HEADERS
-        ]
-        payload = json.dumps(
-            {
-                "status": response.status_code,
-                "headers": stored_headers,
-                "body": base64.b64encode(body).decode("ascii"),
-            }
-        )
-
         try:
-            await redis.set(cache_key, payload, ex=self.ttl_seconds)
+            await redis.set(cache_key, body, ex=self.ttl_seconds)
         except RedisError:
             logger.warning("Redis cache write failed; response was not cached")

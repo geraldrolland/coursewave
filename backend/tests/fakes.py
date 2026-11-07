@@ -52,7 +52,7 @@ class FakeRedis:
     """
 
     def __init__(self) -> None:
-        self.values: dict[str, str] = {}
+        self.values: dict[str, Any] = {}
         self.ttls: dict[str, int] = {}
         self.token_buckets: dict[str, tuple[float, float]] = {}
         self.deleted: list[str] = []
@@ -80,7 +80,7 @@ class FakeRedis:
 
         self.fail_all = error or RedisError("redis unavailable")
 
-    def seed(self, key: str, value: str, ttl: int | None = None) -> None:
+    def seed(self, key: str, value: str | bytes, ttl: int | None = None) -> None:
         """Synchronously preload a key for a test."""
 
         self.values[key] = value
@@ -93,14 +93,14 @@ class FakeRedis:
         if error is not None:
             raise error
 
-    async def get(self, key: str) -> str | None:
+    async def get(self, key: str) -> str | bytes | None:
         self._record("get", key)
         return self.values.get(key)
 
     async def set(
         self,
         key: str,
-        value: str,
+        value: str | bytes,
         ex: int | None = None,
         px: int | None = None,
         nx: bool = False,
@@ -109,7 +109,7 @@ class FakeRedis:
         if nx and key in self.values:
             return None
 
-        self.values[key] = str(value)
+        self.values[key] = value
         if ex is not None:
             self.ttls[key] = int(ex)
         elif px is not None:

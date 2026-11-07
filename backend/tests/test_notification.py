@@ -38,18 +38,26 @@ class RetryCalled(Exception):
 class FakeTask:
     """Minimal bound Celery task double."""
 
-    def __init__(self, retries: int = 0, max_retries: int = 5) -> None:
-        self.request = SimpleNamespace(retries=retries)
+    def __init__(
+        self,
+        retries: int = 0,
+        max_retries: int = 5,
+        headers: dict[str, Any] | None = None,
+    ) -> None:
+        self.request = SimpleNamespace(retries=retries, headers=headers or {})
         self.max_retries = max_retries
         self.retry_calls: list[tuple[float | None, Exception | None]] = []
+        self.retry_headers: list[dict[str, Any]] = []
 
     def retry(
         self,
         exc: Exception | None = None,
         countdown: float | None = None,
+        headers: dict[str, Any] | None = None,
         **_: Any,
     ) -> None:
         self.retry_calls.append((countdown, exc))
+        self.retry_headers.append(dict(headers or {}))
         raise RetryCalled(countdown, exc)
 
 
@@ -141,9 +149,9 @@ def test_celery_task_options() -> None:
     assert process_notification.name == "notification.process_notification"
     assert process_notification.max_retries == 5
     assert process_notification.default_retry_delay == 10
-    assert process_notification.retry_backoff == 10
-    assert process_notification.retry_jitter is True
-    assert process_notification.autoretry_for == (NotificationError,)
+    assert not hasattr(process_notification, "retry_backoff")
+    assert not hasattr(process_notification, "retry_jitter")
+    assert not hasattr(process_notification, "autoretry_for")
     assert process_notification.acks_late is True
     assert process_notification.reject_on_worker_lost is True
     assert process_notification.acks_on_failure_or_timeout is False
@@ -156,7 +164,7 @@ def test_celery_task_options() -> None:
 def test_celery_queue_topology() -> None:
     queues = {queue.name: queue for queue in celery_app.conf.task_queues}
 
-    assert set(queues) == {"task", "task.dlq"}
+    assert set(queues) == {"task", "task.dlq", "task.retry"}
     assert queues["task"].exchange.name == "task"
     assert queues["task"].exchange.type == "topic"
     assert queues["task"].routing_key == "task"
@@ -172,6 +180,17 @@ def test_celery_queue_topology() -> None:
     assert queues["task.dlq"].queue_arguments == {
         "x-queue-type": "quorum",
         "x-delivery-limit": -1,
+    }
+    assert queues["task.retry"].exchange.name == "task.dlx"
+    assert queues["task.retry"].exchange.type == "topic"
+    assert queues["task.retry"].routing_key == "task.retry"
+    assert queues["task.retry"].queue_arguments == {
+        "x-queue-type": "quorum",
+        "x-message-ttl": 300000,
+        "x-dead-letter-exchange": "task",
+        "x-dead-letter-routing-key": "task",
+        "x-dead-letter-strategy": "at-least-once",
+        "x-overflow": "reject-publish",
     }
     assert celery_app.conf.task_default_queue == "task"
     assert celery_app.conf.task_default_exchange_type == "topic"
@@ -223,13 +242,14 @@ def test_worker_declares_every_queue(
             queues={
                 "task.dlq": FakeQueue("task.dlq"),
                 "task": FakeQueue("task"),
+                "task.retry": FakeQueue("task.retry"),
             }
         ),
     )
 
     declare_queues()
 
-    assert declared == ["task.dlq", "task"]
+    assert declared == ["task.dlq", "task", "task.retry"]
 
 
 def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,16 +295,21 @@ def test_process_notification_marks_processed(monkeypatch: pytest.MonkeyPatch) -
     assert f"notification:commit:{notification.notification_id}" not in redis.values
 
 
-def test_already_processed_notification_is_skipped(
+@pytest.mark.parametrize(
+    "status",
+    [NotificationStatus.PROCESSED, NotificationStatus.FAILED],
+)
+def test_terminal_notification_is_skipped(
     monkeypatch: pytest.MonkeyPatch,
+    status: NotificationStatus,
 ) -> None:
-    notification = make_notification(NotificationStatus.PROCESSED)
+    notification = make_notification(status)
     redis = FakeRedis()
     factory = FakeSessionFactory(notification)
     task = FakeTask()
 
     def get_provider(_: NotificationType) -> None:
-        pytest.fail("Provider must not be resolved for a processed notification")
+        pytest.fail("Provider must not be resolved for a terminal notification")
 
     monkeypatch.setattr(
         ProviderManager,
@@ -301,7 +326,7 @@ def test_already_processed_notification_is_skipped(
         )
     )
 
-    assert notification.status is NotificationStatus.PROCESSED
+    assert notification.status is status
     assert factory.commits == []
     assert f"notification:process:{notification.notification_id}" not in redis.values
     assert f"notification:commit:{notification.notification_id}" not in redis.values
@@ -312,7 +337,15 @@ def test_process_lock_busy_retries_with_lock_ttl() -> None:
     redis = FakeRedis()
     redis.seed(f"notification:process:{notification.notification_id}", "other")
     factory = FakeSessionFactory(notification)
-    task = FakeTask()
+    task = FakeTask(
+        headers={
+            "x-retries": 2,
+            "x-death": [{"queue": "task"}],
+            "x-first-death-queue": "task",
+            "eta": "2026-01-01T00:00:00+00:00",
+            "expires": "2026-01-01T00:00:00+00:00",
+        }
+    )
 
     with pytest.raises(RetryCalled) as exc_info:
         asyncio.run(
@@ -327,51 +360,19 @@ def test_process_lock_busy_retries_with_lock_ttl() -> None:
     assert exc_info.value.countdown == NOTIFICATION_LOCK_TTL_SECONDS
     assert exc_info.value.exc is None
     assert task.retry_calls[0][0] == NOTIFICATION_LOCK_TTL_SECONDS
+    assert task.retry_headers[0] == {"x-retries": 2}
     assert factory.commits == []
 
 
-def test_notification_error_retries_before_max_retries(
+@pytest.mark.parametrize("retries", [0, 5])
+def test_notification_error_rejects_with_requeue_for_dlq(
     monkeypatch: pytest.MonkeyPatch,
+    retries: int,
 ) -> None:
     notification = make_notification()
     redis = FakeRedis()
     factory = FakeSessionFactory(notification)
-    task = FakeTask(retries=0)
-
-    class FailingProvider:
-        def process(self, notification: Notification) -> None:
-            raise NotificationError("delivery failed")
-
-    monkeypatch.setattr(
-        ProviderManager,
-        "get_provider",
-        lambda _: FailingProvider(),
-    )
-
-    with pytest.raises(NotificationError):
-        asyncio.run(
-            _process_notification(
-                task,
-                notification.notification_id,
-                redis,
-                factory,
-            )
-        )
-
-    assert notification.status is NotificationStatus.PENDING
-    assert factory.commits == []
-    assert task.retry_calls == []
-    assert f"notification:process:{notification.notification_id}" not in redis.values
-    assert f"notification:commit:{notification.notification_id}" not in redis.values
-
-
-def test_notification_error_marks_failed_and_rejects_after_max_retries(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    notification = make_notification()
-    redis = FakeRedis()
-    factory = FakeSessionFactory(notification)
-    task = FakeTask(retries=5)
+    task = FakeTask(retries=retries)
 
     class FailingProvider:
         def process(self, notification: Notification) -> None:
@@ -393,10 +394,10 @@ def test_notification_error_marks_failed_and_rejects_after_max_retries(
             )
         )
 
-    assert exc_info.value.requeue is False
+    assert exc_info.value.requeue is True
     assert isinstance(exc_info.value.__cause__, NotificationError)
-    assert notification.status is NotificationStatus.FAILED
-    assert factory.commits == [NotificationStatus.FAILED]
+    assert notification.status is NotificationStatus.PENDING
+    assert factory.commits == []
     assert task.retry_calls == []
     assert f"notification:process:{notification.notification_id}" not in redis.values
     assert f"notification:commit:{notification.notification_id}" not in redis.values
