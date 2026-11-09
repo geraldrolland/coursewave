@@ -10,7 +10,8 @@ delivery through an external broker.
 | Service | Description | Port |
 |---------|-------------|------|
 | `coursewave` | FastAPI backend | `3000` |
-| `worker` | Celery worker for notification tasks | - |
+| `worker` | Celery worker for notification and outbox tasks | - |
+| `beat` | Celery Beat scheduler for the outbox dispatcher | - |
 | `dlq-consumer` | Retries dead-lettered tasks and marks exhausted notifications failed | - |
 | `postgres` | PostgreSQL 17 with `coursewave_db` | `5432` |
 | `redis` | Sessions, cache, rate limits, verification tokens, notification locks | `6379` |
@@ -29,9 +30,11 @@ at `http://localhost:3000/docs` and requires a Bearer access token.
 ## Backend
 
 See [`backend/README.md`](backend/README.md) for configuration, middleware
-behavior, the authentication and refresh-token contracts, the notification
-task flow and queue topology, email template rendering, notification providers,
-authenticated WebSocket notifications, and testing instructions.
+behavior, registration, login, Google authentication, current-session lookup,
+email verification, password reset, the authentication and refresh-token
+contracts, the notification task flow and queue topology, email template
+rendering, notification providers, authenticated WebSocket notifications, and
+testing instructions.
 
 ## Tests
 

@@ -8,7 +8,13 @@ requested refinements:
 - JSON-only response caching.
 - Configurable prefix-based rate limiting with a strategy-to-handler registry.
 - Student auth methods (EMAIL | GOOGLE) with nullable password hashes.
-- Removal of the transactional outbox model.
+- Student login, email verification, password-reset email, and password-reset
+  endpoints backed by Redis action tokens and the transactional outbox.
+- Google OAuth login that exchanges the authorization code, creates or verifies
+  the student, issues a session and refresh cookie, and redirects to the app.
+- A protected current-session endpoint returning the authenticated user's id and
+  email from Redis.
+- A transactional outbox service dispatched by Celery Beat every 10 seconds.
 - A notification model and Celery task backed by RabbitMQ queues, Redis locks,
   retries, and a dead-letter queue.
 - A typed Jinja email template manager for OTP and email verification messages,
@@ -88,8 +94,10 @@ Notifications and Celery
   notification_status. They store lowercase values.
 - Notification has no send() method. process_notification resolves a provider
   through ProviderManager and calls provider.process(notification).
-- Celery configuration lives in backend/celery_app.py. It imports
-  app.services.notification.task.process_notification and exposes `app` for
+- Celery configuration lives in backend/celery_app/__init__.py, with
+  backend/celery_app/task_registry.py mapping short task names to callables. It
+  imports app.services.notification.task.process_notification and
+  app.services.outbox.task.process_outbox, and exposes `app` for
   `celery -A celery_app`.
 - Task name: notification.process_notification. Task options:
     max_retries=5
@@ -144,7 +152,7 @@ Notifications and Celery
 DLQ Consumer
 - Package: backend/dlq with __init__.py, consumer.py, and handlers.py.
 - TASK_RETRY = "task.retry", DLQ_MAX_RETRIES = 3, and
-  TASK_RETRY_TTL_SECONDS = 300 live in celery_app.py.
+  TASK_RETRY_TTL_SECONDS = 300 live in celery_app/__init__.py.
 - The consumer uses Kombu (already installed with Celery), not pika.
 - It consumes task.dlq with prefetch_count=1 and publisher confirms enabled via
   transport_options={"confirm_publish": True}.
@@ -174,6 +182,46 @@ DLQ Consumer
 - The consumer acknowledges only after the retry publish is confirmed or the
   terminal handler succeeds. Duplicates remain acceptable under
   at-least-once delivery; the task and handler are idempotent.
+
+Transactional Outbox
+- New service at backend/app/services/outbox/ with model/outbox.py and
+  task/process_outbox.py.
+- Outbox (table "outbox") fields:
+    id: UUID primary key (uuid4)
+    status: OutboxStatus PENDING = "pending", PROCESSED = "processed",
+            FAILED = "failed"
+    retry_after: timezone-aware datetime or None, default None
+    num_of_retries: int, default 0
+    payload: JSON object
+    table: string, e.g. "notification"
+    ref_id: string containing the actual referenced row ID
+- The database enum is named outbox_status and stores lowercase values.
+- Outbox.payload shape:
+    {"argument": {"notification_id": "<uuid>"},
+     "task_name": "process_notification"}
+- Celery Beat schedule runs outbox.process_outbox every 10 seconds. The task
+  queries up to 50 rows with status=pending and retry_after null or in the past.
+- Each row is processed in its own session/transaction:
+    1. Acquire Redis lock outbox:process:<outbox id> with TTL 60 seconds.
+    2. Re-load the row with FOR UPDATE SKIP LOCKED and re-check its state.
+    3. Resolve task_name through TASK_REGISTRY.
+    4. Invoke the callable with **payload["argument"].
+       Synchronous Celery tasks run via asyncio.to_thread so their internal
+       asyncio.run does not nest inside the outbox event loop.
+    5. Success: status=processed, retry_after=None, commit.
+- Lock contention logs and skips the row without consuming a retry.
+- Failure: attempt = num_of_retries + 1.
+    attempt < 5 -> num_of_retries=attempt and
+      retry_after=utc_now() + 10 seconds * attempt; status stays pending.
+    attempt >= 5 -> num_of_retries=5, retry_after=None, status=failed, and the
+      row referenced by table/ref_id is marked failed (notification
+      PROCESSED stays unchanged, FAILED is idempotent, PENDING becomes FAILED).
+- The Redis lock is released in a finally block.
+- TASK_REGISTRY = {"process_notification": process_notification,
+  "process_outbox": process_outbox}. It lives in
+  backend/celery_app/task_registry.py.
+- Registration writes Student, Notification, and Outbox in one transaction and
+  no longer publishes a task directly from the request.
 
 Email Templates
 - New service at
@@ -209,8 +257,9 @@ Notification Providers
 - BaseProvider defines abstract process(notification).
 - EmailProvider reads payload["template_type"], payload["content"], and the
   recipient from payload["to_email"] with payload["email"] as a fallback.
-- EMAIL_SUBJECT_REGISTRY contains "email_verification" -> "verify your email"
-  and "otp" -> "your verification code".
+- EMAIL_SUBJECT_REGISTRY contains "email_verification" -> "verify your email",
+  "otp" -> "your verification code", and "forgot_password" ->
+  "reset your password".
 - EmailProvider renders with TemplateManager and sends a SendGrid Mail object.
   Logic errors raise ProviderError. SendGrid client and non-2xx response errors
   raise ProviderServiceNotAvailableError (alias ProviderServiceNotAvailbleError).
@@ -263,14 +312,15 @@ WebSocket Notifications
   and commits run on a dedicated single-thread executor.
 
 Prior decisions that remain in place
-- Student registration remains public and unchanged.
+- Student registration remains public and now uses the transactional outbox.
 - Student.auth_method is an AuthMethod enum with EMAIL = "email" and
   GOOGLE = "google"; the database enum is named auth_method and stores the
   lowercase values.
 - Student.password_hash is nullable with a NULL default, but email
   registration still hashes and stores a password.
 - register_student sets auth_method=AuthMethod.EMAIL explicitly.
-- The Outbox model and all outbox writes are removed.
+- The outbox was reintroduced under app/services/outbox; registration writes
+  Student, Notification, and Outbox in one transaction.
 - New error bodies use {"detail": "..."}.
 - Compose service is named coursewave, builds ./backend, publishes 3000:8000.
 - RabbitMQ handles Celery; Kafka is used only for push notifications;
@@ -300,8 +350,9 @@ Completed
 - Added the CACHE_ROUTES allowlist, JSON-only cache storage, and the related
   tests. The cache now stores only the response body; response headers are not
   persisted and cache hits regenerate Content-Type, Content-Length, and X-Cache.
-- Added AuthMethod, nullable password_hash, and removed the Outbox model and
-  registration-side outbox writes.
+- Added AuthMethod, nullable password_hash, and temporarily removed the Outbox
+  model and registration-side outbox writes; the outbox was later reintroduced
+  under app/services/outbox.
 - Created the notification service, Notification model, NotificationError, and
   process_notification task.
 - Updated process_notification so a busy process lock retries with the
@@ -309,10 +360,11 @@ Completed
 - Removed Notification.release_after and its task-side update, and moved the
   process_notification task into notification/task/process_notification.py.
 - Added backend/celery_app.py with quorum queues, DLX/DLQ routing, retry/ack
-  settings, the task route, and worker queue declaration.
+  settings, the task route, and worker queue declaration; it is now
+  backend/celery_app/__init__.py.
 - Imported Notification in app/main.py so create_all includes the table.
-- Added Celery to requirements.txt and updated the Dockerfile to copy
-  celery_app.py.
+- Added Celery to requirements.txt and updated the Dockerfile to copy the
+  celery_app package.
 - Added the worker service and a shared backend environment anchor to
   docker-compose.yml.
 - Added FakeLock/FakeRedis.lock and backend/tests/test_notification.py.
@@ -345,7 +397,7 @@ Completed
 - Replaced the deprecated httpx TestClient dependency with httpx2 and added
   targeted pytest filters for kafka-python's importlib.resources warnings.
 - Added the task.retry queue, DLQ_MAX_RETRIES/TASK_RETRY_TTL_SECONDS constants,
-  shared DEATH_HEADERS, and the declare_all_queues helper to celery_app.py.
+  shared DEATH_HEADERS, and the declare_all_queues helper to celery_app.
 - Changed process_notification to reject provider failures with
   Reject(requeue=True), skip every non-pending status, and preserve custom
   headers on lock-contention retries.
@@ -354,6 +406,44 @@ Completed
 - Added the dlq copy to the Dockerfile and the dlq-consumer Compose service.
 - Added tests/test_dlq.py and updated test_notification.py for the new task and
   queue behavior.
+- Converted celery_app.py into the celery_app package with __init__.py and
+  task_registry.py; all defined Celery tasks are registered by short name.
+- Added the outbox service, Outbox model, Beat-scheduled process_outbox task,
+  per-row Redis locks, retry budgeting, and terminal notification failure.
+- Updated registration to build the verification link, create a Notification and
+  Outbox row in the same transaction, and let Beat dispatch the task.
+- Added the beat Compose service and updated Dockerfile/README/context files.
+- Added tests/test_outbox.py and updated test_register.py for the outbox flow.
+- Added the student login endpoint with generic 401 credential failures, 403
+  unverified-email handling, Redis session creation, access/refresh JWTs, and
+  the signed refresh cookie.
+- Added PATCH /student/api/v1/verify-email with a strict token schema, Redis
+  token lookup, idempotent verification, and best-effort token deletion.
+- Added POST /student/api/v1/email with a generic 200 response, 120-second
+  reset tokens, forgot_password notifications, and outbox rows.
+- Added PATCH /student/api/v1/password-reset with the shared password policy,
+  Argon2 rehashing, email verification, and token deletion.
+- Added the forgot_password template type, HTML template, and SendGrid subject.
+- Added GET /student/api/v1/google?code=... for Google OAuth. It exchanges the
+  code at oauth2.googleapis.com/token, fetches account details from
+  www.googleapis.com/oauth2/v2/userinfo, and looks up the student by email.
+  Existing accounts are marked verified when needed without changing
+  auth_method. New accounts are created with auth_method=google,
+  is_email_verified=true, and no password hash. Success creates a Redis session,
+  sets the signed refresh cookie, and redirects to {app_host}/dashboard; any
+  failure redirects to {app_host}/login?msg=google_authentication_failed.
+- Added google_client_id, google_client_secret, and google_redirect_uri settings
+  with placeholder defaults, and added /student/api/v1/google to the public auth
+  exclude paths.
+- Added GET /student/api/v1/me, which returns {id, email} from the authenticated
+  Redis session. It exposes session userId as id and does not return role. The
+  path is protected by AuthMiddleware because it is not in AUTH_EXCLUDE_PATHS.
+  Incomplete session documents return 401 "Invalid authentication session".
+- Extracted build_refresh_cookie into app/security.py and reused it from login
+  and RefreshTokenMiddleware.
+- Added tests/test_login.py, tests/test_verify_email.py,
+  tests/test_password_reset.py, tests/test_google.py, and
+  tests/student_fakes.py; extended schema, template, and provider tests.
 - Updated README.md, backend/README.md, and this context file.
 
 Active
@@ -362,32 +452,36 @@ Active
 Blocked
 - RabbitMQ is not reachable on localhost:5672 in this environment, and no
   Docker CLI, RabbitMQ binary, or Erlang service is installed, so live
-  end-to-end DLQ delivery could not be exercised.
+  end-to-end DLQ and outbox delivery could not be exercised. The student auth
+  and account-recovery endpoints are covered with fake Redis and DB sessions.
 
 Next Move
-- None. The DLQ implementation is complete and validated with unit tests.
+- None. The outbox, student authentication/recovery, Google OAuth, and current
+  session flows are complete and validated with unit tests.
 
 
 Known Gaps
-- No notification enqueue endpoint or scheduler exists; another component must
-  insert Notification rows and submit the task.
+- There is no general-purpose notification enqueue endpoint. New producers
+  should insert an Outbox row in the same transaction as their business write.
 - Kafka is not included in docker-compose.yml; push delivery and WebSocket
   fan-out require an external broker configured by
   kafka_bootstrap_servers.
 - KAFKA_CONSUMER_ENABLED defaults to false; set it to true to start the
   Kafka-to-WebSocket consumer.
-- SendGrid, Termii, and Kafka defaults are placeholders that must be replaced.
-- No login/token-issuer endpoint exists; auth validates existing access tokens
-  and refresh rotates existing sessions only.
-- No migration framework exists. Existing databases need the notification table
-  created manually because create_all only creates missing tables on a fresh
-  database. If the earlier schema exists, drop the unused release_after column
-  manually.
+- SendGrid, Termii, Kafka, and Google OAuth defaults are placeholders that must
+  be replaced.
+- Google OAuth does not validate an OAuth state parameter; the callback only
+  exchanges the code and redirects.
+- Password reset does not invalidate existing access or refresh sessions.
+- No migration framework exists. Existing databases need the notification and
+  outbox tables created manually because create_all only creates missing tables
+  on a fresh database. If the earlier schema exists, drop the unused
+  release_after column manually.
 
 
 Validation Results
 ------------------
-- pytest -q: 224 passed, no warnings.
+- pytest -q: 324 passed, no warnings.
 - compileall: passed.
 - pip check: no broken requirements.
 - App import prints: CourseWave API.
@@ -532,9 +626,17 @@ Relevant Files
   scope session data.
 - backend/tests/test_ws_manager.py
   WebSocket registration, removal, active-only sends, and stale socket cleanup.
-- backend/celery_app.py
+- backend/celery_app/__init__.py
   Celery app, queue/DLX/DLQ/retry declarations, shared DEATH_HEADERS, retry and
-  ack settings, task route, declare_all_queues, and the worker_init declaration.
+  ack settings, task routes, Beat schedule, declare_all_queues, and the
+  worker_init declaration.
+- backend/celery_app/task_registry.py
+  TASK_REGISTRY mapping short task names to the defined Celery task callables.
+- backend/app/services/outbox/model/outbox.py
+  Outbox model, OutboxStatus enum, retry/payload/table/ref_id fields.
+- backend/app/services/outbox/task/process_outbox.py
+  Beat-dispatched outbox processor, due-row query, Redis locks, task registry
+  dispatch, retry budget, and terminal notification failure.
 - backend/dlq/__init__.py
   Dead-letter queue package marker.
 - backend/dlq/consumer.py
@@ -559,8 +661,8 @@ Relevant Files
 - backend/pytest.ini
   Targeted filters for kafka-python importlib.resources deprecation warnings.
 - backend/Dockerfile
-  Installs requirements, copies app, templates, celery_app.py, and dlq, and runs
-  uvicorn.
+  Installs requirements, copies app, templates, celery_app package, and dlq, and
+  runs uvicorn.
 - docker-compose.yml
   coursewave, worker, dlq-consumer, postgres, redis, and rabbitmq; shared
   backend environment with SendGrid, Kafka producer/consumer, and Termii
@@ -588,6 +690,45 @@ Important Context
 - Identifiers: authenticated session userId, otherwise socket IP.
 - Student auth: AuthMethod.EMAIL.value == "email" and
   AuthMethod.GOOGLE.value == "google". password_hash is str | None.
+- Student login: POST /student/api/v1/login. Unknown email, missing password
+  hash, and wrong password all return 401 "Invalid email or password".
+  Unverified accounts get a fresh 120-second verification token, notification,
+  outbox row, and 403. Verified accounts get a UUID session ID stored at
+  session:<id> as {userId, role: "student", email} with a 604800-second TTL,
+  an access JWT in {"accessToken": ...}, and a signed refresh cookie.
+- Google auth: GET /student/api/v1/google?code=... is public. It exchanges the
+  code for an access token, fetches userinfo, looks up the student by normalized
+  email, and either verifies the existing account or creates a new account with
+  AuthMethod.GOOGLE, is_email_verified=true, and password_hash=None. Success
+  reuses _create_login_tokens and build_refresh_cookie, then redirects 302 to
+  {app_host}/dashboard. Missing code and any exception redirect 302 to
+  {app_host}/login?msg=google_authentication_failed. Google credentials come
+  from google_client_id, google_client_secret, and google_redirect_uri; all
+  default to placeholders. OAuth state is not validated.
+- Current session: GET /student/api/v1/me is protected; it is not in
+  AUTH_EXCLUDE_PATHS. It reads request.state.user and returns {id, email}, where
+  id is the session userId. It does not query the database or return role.
+  Missing/invalid/expired tokens or sessions are rejected by AuthMiddleware.
+  A session without non-empty string userId and email returns 401 "Invalid
+  authentication session".
+- Verify email: PATCH /student/api/v1/verify-email with {"token": ...}. The
+  Redis token maps to a user UUID, the student is marked verified, and the token
+  is deleted after commit. Missing/expired/malformed tokens return 400; a
+  missing student returns 404. Already-verified accounts are idempotent.
+- Password-reset email: POST /student/api/v1/email with {"email": ...}. Always
+  returns the generic PASSWORD_RESET_SENT 200 response. Existing accounts get a
+  120-second token whose link is {app_host}/forgot-password?token=..., plus a
+  forgot_password notification and outbox row.
+- Password reset: PATCH /student/api/v1/password-reset with password,
+  confirm_password, and token. It reuses the registration password policy,
+  hashes the new password, marks the email verified if needed, and deletes the
+  token after commit. Invalid/expired tokens return 400; a missing student
+  returns 404.
+- Verification and password-reset tokens use the raw token as the Redis key and
+  the user UUID as the value, matching registration; they are not
+  purpose-namespaced.
+- build_refresh_cookie in app/security.py creates the signed refresh Set-Cookie
+  value for both login and RefreshTokenMiddleware.
 - Notification enums store lowercase values; Notification.status defaults to
   pending.
 - Notification process lock key: notification:process:<id>, with a 120-second
@@ -596,10 +737,11 @@ Important Context
 - The task skips every status other than pending. Provider failures raise
   Reject(requeue=True) and leave the status pending; the DLQ consumer is the
   only component that marks a notification failed.
-- TemplateManager accepts `otp` or `email_verification` as either a string or
-  TemplateType. Email verification templates use the `link` content key; OTP
-  templates use `otp`. Rendered templates expose body, version_number, and
-  template_path; subjects are provider-owned.
+- TemplateManager accepts `otp`, `email_verification`, or `forgot_password` as
+  either a string or TemplateType. Email verification and forgot-password
+  templates use the `link` content key; OTP templates use `otp`. Rendered
+  templates expose body, version_number, and template_path; subjects are
+  provider-owned.
 - Notification has no send() method. The task resolves ProviderManager using
   notification.type and calls provider.process(notification).
 - ProviderManager has email, push, and sms providers registered. Email
@@ -640,6 +782,19 @@ Important Context
   notifications untouched, treats failed as idempotent, and changes pending to
   failed. Poison DLQ messages are acked; handler/DB/publish failures are
   throttled for 5 seconds and rejected with requeue=True.
+- Outbox payload key is `argument` (singular) and holds the task kwargs.
+  `table` plus `ref_id` identify the referenced row; ref_id stores the actual ID
+  value, for example a notification UUID string.
+- outbox.process_outbox runs every 10 seconds, selects at most 50 pending rows
+  with retry_after null or in the past, and uses a 60-second Redis lock per row.
+- Outbox retries use attempt = num_of_retries + 1. Below five, retry_after is
+  utc_now() + 10 seconds * attempt. At five or more, the outbox row and its
+  referenced notification become failed.
+- The outbox invokes registry functions directly. Synchronous Celery tasks are
+  run with asyncio.to_thread; this bypasses RabbitMQ retry/DLQ for
+  outbox-dispatched notification tasks, whose retry budget is the outbox.
+- Registration writes the verification Notification and Outbox row in the same
+  transaction and does not publish the task from the request.
 - Compose service publishes host port 3000 to container port 8000.
 - Registration remains public at /student/api/v1/register.
 - All new error responses use {"detail": "..."}.

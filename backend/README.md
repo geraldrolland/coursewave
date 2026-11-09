@@ -78,12 +78,19 @@ backend/
 │       │       ├── __init__.py
 │       │       ├── authentication.py
 │       │       └── websocket_notif_manager.py
+│       ├── outbox/
+│       │   ├── model/
+│       │   │   └── outbox.py
+│       │   └── task/
+│       │       └── process_outbox.py
 │       └── student/
 │           ├── exception/
 │           ├── model/
 │           ├── router/
 │           └── schema/
-├── celery_app.py
+├── celery_app/
+│   ├── __init__.py
+│   └── task_registry.py
 ├── dlq/
 │   ├── __init__.py
 │   ├── consumer.py
@@ -128,6 +135,9 @@ Copy-Item .env.example .env
 | `ACCESS_TOKEN_EXPIRY` | Access-token lifetime (`ms`, `s`, `m`, `h`, `d`, `w`) | `7m` |
 | `REFRESH_TOKEN_EXPIRY` | Refresh-token lifetime | `7d` |
 | `REFRESH_TOKEN_MAX_AGE_SECONDS` | Redis session TTL extension and cookie `Max-Age` | `604800` |
+| `GOOGLE_CLIENT_ID` | Google OAuth client ID | `GOOGLE_CLIENT_ID_PLACEHOLDER` |
+| `GOOGLE_CLIENT_SECRET` | Google OAuth client secret | `GOOGLE_CLIENT_SECRET_PLACEHOLDER` |
+| `GOOGLE_REDIRECT_URI` | Registered Google OAuth callback URL | `GOOGLE_REDIRECT_URI_PLACEHOLDER` |
 | `AUTH_EXCLUDE_PATHS` | Comma-separated public paths | see `.env.example` |
 | `CORS_ORIGIN` | `*`, one origin, or a comma-separated list | `*` |
 | `CORS_METHODS` | Comma-separated allowed methods | `GET,POST,PUT,PATCH,DELETE,OPTIONS` |
@@ -392,8 +402,9 @@ Exposed response headers include `X-Request-ID`, the rate-limit headers,
 
 ## Student Registration
 
-`POST /student/api/v1/register` is public and unchanged. It creates a student
-account and queues the email verification event.
+`POST /student/api/v1/register` is public. It creates a student account,
+persists an email verification notification, and writes a transactional outbox
+row so the notification is dispatched after the database commit.
 
 Request body:
 
@@ -413,7 +424,15 @@ The endpoint:
 1. Hashes the password with Argon2.
 2. Generates a URL-safe verification token and stores it in Redis with the
    student UUID as its value and a 120-second TTL.
-3. Inserts the `Student` with `auth_method=EMAIL` and the hashed password.
+3. Builds `{APP_HOST}/email-verification?token={token}`. A missing
+   `http://`/`https://` scheme is added automatically.
+4. Inserts the `Student` with `auth_method=EMAIL` and the hashed password.
+5. Inserts an email `Notification` with a provider-compatible payload:
+   `template_type=email_verification`, `content={"link": ...}`, and `to_email`.
+6. Inserts an `Outbox` row with
+   `payload={"argument": {"notification_id": "..."}, "task_name": "process_notification"}`,
+   `table="notification"`, and `ref_id=<notification UUID>`.
+7. Commits the student, notification, and outbox rows in one transaction.
 
 `password_hash` is nullable at the model level, allowing future
 `auth_method=GOOGLE` accounts to have no local password.
@@ -434,7 +453,162 @@ Errors:
 - `503 Service Unavailable` when Redis cannot store the verification token.
 
 If the database transaction fails after the Redis token is written, the token is
-deleted on a best-effort basis.
+deleted on a best-effort basis. No task is published directly from the request.
+
+## Student Login
+
+`POST /student/api/v1/login` is public.
+
+Request body:
+
+```json
+{
+  "email": "ada@example.com",
+  "password": "StrongPass1!"
+}
+```
+
+The endpoint queries the student by normalized email. Unknown emails, accounts
+without a local password, and incorrect passwords all return the same
+`401 {"detail": "Invalid email or password"}` response.
+
+If the password is correct but `is_email_verified` is false, the endpoint:
+
+1. Creates a new 120-second verification token in Redis.
+2. Queues an `email_verification` notification and outbox row.
+3. Returns a `403` explaining that a fresh verification email was sent.
+
+If the email is verified, the endpoint:
+
+1. Generates a UUID session ID.
+2. Stores `session:<session_id>` in Redis as
+   `{"userId": "...", "role": "student", "email": "..."}` with a 604800-second
+   TTL.
+3. Issues access and refresh JWTs.
+4. Sets the signed refresh cookie with `HttpOnly; Secure; SameSite=Strict`,
+   `Path=/auth/api/v1/token-refresh`, and `Max-Age=604800`.
+5. Returns `200 {"accessToken": "..."}`.
+
+The refresh endpoint accepts that cookie and rotates both tokens using the same
+session ID.
+
+## Google Authentication
+
+`GET /student/api/v1/google?code=...` is public and is intended to be the
+browser-facing OAuth callback.
+
+The endpoint uses the configured Google credentials to:
+
+1. Exchange the authorization code at
+   `https://oauth2.googleapis.com/token` for an access token.
+2. Fetch the account details from
+   `https://www.googleapis.com/oauth2/v2/userinfo`.
+3. Look up the student by the returned email address.
+
+If the student already exists, the email is marked verified when necessary.
+Their `auth_method` is left unchanged. If no student exists, a new account is
+created with `is_email_verified=true`, `auth_method=google`, and no password
+hash. The student's first and last names come from `given_name`/`family_name`,
+the full `name`, or the email local part as a fallback.
+
+On success the endpoint creates the same Redis session and signed refresh cookie
+as password login, then redirects with `302` to `{APP_HOST}/dashboard`. The
+dashboard can call `/auth/api/v1/token-refresh` to obtain an access token.
+
+Any failure, including a missing code, HTTP error, invalid userinfo response,
+database error, or Redis error, redirects with `302` to
+`{APP_HOST}/login?msg=google_authentication_failed`.
+
+```env
+GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID_PLACEHOLDER
+GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET_PLACEHOLDER
+GOOGLE_REDIRECT_URI=GOOGLE_REDIRECT_URI_PLACEHOLDER
+```
+
+The values are placeholders until real Google Cloud OAuth credentials are
+configured. `GOOGLE_REDIRECT_URI` must exactly match the redirect URI registered
+for the Google OAuth client.
+
+## Current Session
+
+`GET /student/api/v1/me` requires a Bearer access token.
+
+The endpoint reads the authenticated Redis session that `AuthMiddleware` stores
+on `request.state.user` and returns:
+
+```json
+{
+  "id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+  "email": "ada@example.com"
+}
+```
+
+The internal session field `userId` is exposed as `id`; the `role` field is not
+returned. No database lookup is performed. The endpoint is protected because it
+is not listed in `AUTH_EXCLUDE_PATHS`, so missing, invalid, expired, or
+session-less tokens return `401`. A session document without non-empty string
+`userId` and `email` values also returns
+`401 {"detail": "Invalid authentication session"}`.
+
+## Email Verification
+
+`PATCH /student/api/v1/verify-email` is public.
+
+Request body:
+
+```json
+{
+  "token": "verification-token"
+}
+```
+
+The token is read from Redis and resolved to a student UUID. Invalid or expired
+tokens return `400`; a missing student returns `404`. On success the student's
+`is_email_verified` flag is set to true, the token is deleted, and the endpoint
+returns `200 {"message": "Email verified successfully"}`. Already-verified
+accounts receive the same response.
+
+## Password Reset
+
+### Request a reset email
+
+`POST /student/api/v1/email` is public.
+
+Request body:
+
+```json
+{
+  "email": "ada@example.com"
+}
+```
+
+The endpoint always returns
+`200 {"message": "If the email is registered, a password reset link has been sent."}`
+to avoid account enumeration. When the student exists, it generates a
+120-second token, builds `{APP_HOST}/forgot-password?token={token}`, and queues a
+`forgot_password` notification plus outbox row.
+
+### Reset the password
+
+`PATCH /student/api/v1/password-reset` is public.
+
+Request body:
+
+```json
+{
+  "password": "NewStrong2!",
+  "confirm_password": "NewStrong2!",
+  "token": "password-reset-token"
+}
+```
+
+Passwords must be 8-128 characters and contain uppercase, lowercase, numeric,
+and special characters. Invalid or expired tokens return `400`; a missing
+student returns `404`. On success the new Argon2 hash is stored, the email is
+marked verified if necessary, the token is deleted, and the endpoint returns
+`200 {"message": "Password reset successfully"}`.
+
+Redis failures for the login, verification, and reset flows return `503`.
 
 ## Email Templates
 
@@ -454,8 +628,8 @@ rendered.version_number
 rendered.template_path
 ```
 
-`TemplateManager` accepts either the string values `otp` and
-`email_verification` or their `TemplateType` enum members. `get_template()`
+`TemplateManager` accepts either the string values `otp`, `email_verification`,
+and `forgot_password` or their `TemplateType` enum members. `get_template()`
 returns a frozen `template` dataclass with `body`, `version_number`, and
 `template_path` fields.
 
@@ -467,6 +641,10 @@ template_registery = {
         "template_dir": "templates/email/email_verification",
         "template": "v1.html",
     },
+    TemplateType.FORGOT_PASSWORD: {
+        "template_dir": "templates/email/forgot_password",
+        "template": "v1.html",
+    },
 }
 ```
 
@@ -474,9 +652,10 @@ template_registery = {
 used by `get_template()`. `version_number` is derived from the pinned filename,
 so `v1.html` returns `1`. Template paths are resolved relative to `backend/`.
 
-The email verification template renders `{{ link }}` as the `href` value.
-The OTP template renders `{{ otp }}` in its message body. `template_build()` is
-the static Jinja rendering helper used by `get_template()`.
+The email verification and forgot-password templates render `{{ link }}` as the
+`href` value. The OTP template renders `{{ otp }}` in its message body.
+`template_build()` is the static Jinja rendering helper used by
+`get_template()`.
 
 ## Notification Providers
 
@@ -578,7 +757,8 @@ it must share the in-memory WebSocket connection registry.
 ## Notifications
 
 Notifications are persisted in the `notification` table and delivered by the
-`notification.process_notification` Celery task.
+`notification.process_notification` Celery task. Registration notifications are
+dispatched through the transactional `outbox` table described below.
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -606,9 +786,11 @@ The task resolves the provider using
    notifications are never delivered again.
 5. Resolves the notification provider and calls `provider.process(notification)`.
 6. On success, marks the notification `processed`.
-7. On `NotificationError`, rejects the message with `requeue=True`. The
-   notification stays `pending`; RabbitMQ redelivers the task until the
-   `task` delivery limit is exhausted, then dead-letters it to `task.dlq`.
+7. On `NotificationError`, rejects the message with `requeue=True`. When the
+   task was published to RabbitMQ, the notification stays `pending` and
+   RabbitMQ redelivers it until the `task` delivery limit is exhausted, then
+   dead-letters it to `task.dlq`. When the task is invoked by the outbox
+   dispatcher, the exception is returned to the outbox retry budget instead.
 
 `max_retries=5` and `default_retry_delay=10` now apply only to lock contention.
 They do not limit provider failures, because provider failures use the broker
@@ -616,6 +798,45 @@ delivery limit and the DLQ retry budget instead.
 
 The process lock is released in a `finally` block, including when a retry or
 reject is raised.
+
+### Transactional outbox
+
+The `outbox` table stores tasks that must be dispatched after the surrounding
+database transaction commits:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | UUID | Primary key |
+| `status` | `pending`, `processed`, `failed` | Defaults to `pending` |
+| `retry_after` | timezone-aware datetime or null | Earliest next attempt |
+| `num_of_retries` | integer | Defaults to `0` |
+| `payload` | JSON object | `{argument: {...}, task_name: "process_notification"}` |
+| `table` | string | Referenced table name, for example `notification` |
+| `ref_id` | string | Referenced row ID |
+
+`outbox.process_outbox` runs every 10 seconds through Celery Beat. Each run
+selects up to 50 pending rows whose `retry_after` is null or in the past:
+
+1. Acquire `outbox:process:<id>` in Redis with a 60-second TTL.
+2. Resolve `payload["task_name"]` through
+   `celery_app/task_registry.py`.
+3. Call the registered function with `payload["argument"]` as keyword
+   arguments. Synchronous Celery tasks are invoked in a worker thread so their
+   internal `asyncio.run` does not conflict with the outbox event loop.
+4. On success, set the outbox row to `processed` and commit.
+5. On failure, schedule the next attempt at
+   `utc_now() + 10 seconds * attempt`, up to five attempts.
+6. On the fifth failure, set the outbox row to `failed`, clear `retry_after`,
+   and mark the referenced notification `failed` in the same transaction.
+
+The Redis lock is always released in a `finally` block. If the lock is already
+held, the row is skipped without consuming its retry budget.
+
+Run the scheduler in addition to the worker:
+
+```powershell
+.venv\Scripts\celery.exe -A celery_app beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+```
 
 ### Queue topology
 
@@ -669,8 +890,9 @@ logged, throttled for five seconds, and rejected with `requeue=True`. The
 consumer enables publisher confirms and acknowledges only after the retry
 publish succeeds or the terminal handler commits.
 
-There is no enqueue endpoint or scheduler yet. Another component must insert a
-`Notification` row and submit `notification.process_notification` with its ID.
+Registration is the current outbox producer. Other features can insert an
+`Outbox` row in the same transaction as their business write and let the Beat
+job dispatch the registered task.
 
 ## API
 
@@ -678,6 +900,12 @@ There is no enqueue endpoint or scheduler yet. Another component must insert a
 |--------|------|-------------|----------------|
 | `GET` | `/health` | Health check | Public |
 | `POST` | `/student/api/v1/register` | Register a student | Public |
+| `POST` | `/student/api/v1/login` | Log in and issue tokens | Public |
+| `GET` | `/student/api/v1/google` | Log in with a Google OAuth code | Public |
+| `GET` | `/student/api/v1/me` | Return the current session identity | Bearer token |
+| `PATCH` | `/student/api/v1/verify-email` | Verify an email address | Public |
+| `POST` | `/student/api/v1/email` | Request a password-reset email | Public |
+| `PATCH` | `/student/api/v1/password-reset` | Reset a password | Public |
 | `POST` | `/auth/api/v1/token-refresh` | Rotate tokens | Refresh cookie |
 | `GET` | `/docs` | FastAPI documentation | Bearer token |
 | `GET` | `/openapi.json` | OpenAPI schema | Bearer token |
@@ -688,32 +916,33 @@ There is no enqueue endpoint or scheduler yet. Another component must insert a
 .venv\Scripts\python -m pytest
 ```
 
-The suite covers authentication, CORS, caching, rate limiting, refresh-token
-rotation, request logging, PostgreSQL configuration, session cleanup,
-registration validation, password hashing, Redis token creation,
-duplicate-email handling, student auth-method defaults, notification model
-defaults, Celery queue topology, lock handling, retry behavior, DLQ republish
-and terminal failure handling, provider dispatch, email template rendering,
-SendGrid error handling, Kafka producer publishing, Kafka consumer dispatch and
-commits, Termii SMS delivery, WebSocket authentication and connection
-management, and processed-notification caching.
+The suite covers authentication, login and token issuance, Google OAuth,
+current-session identity, email verification, password reset, CORS, caching,
+rate limiting, refresh-token rotation, request logging, PostgreSQL
+configuration, session cleanup, registration validation, password hashing,
+Redis token creation, duplicate-email handling, student auth-method defaults,
+notification model defaults, Celery queue topology, lock
+handling, retry behavior, outbox dispatch and retry budgeting, DLQ republish and
+terminal failure handling, provider dispatch, email template rendering, SendGrid
+error handling, Kafka producer publishing, Kafka consumer dispatch and commits,
+Termii SMS delivery, WebSocket authentication and connection management, and
+processed-notification caching.
 
 ## Known Limitations
 
-- There is no login or token-issuance endpoint in this repository. Access and
-  refresh tokens must be issued by another service that creates the matching
-  Redis session.
-- There is no notification enqueue endpoint or scheduler. Notification rows
-  must be created and submitted by another component.
+- Password reset does not invalidate existing access or refresh sessions.
+- There is no general-purpose notification enqueue endpoint. New producers
+  should insert an `Outbox` row in the same transaction as their business
+  write.
 - Kafka is not included in the Compose stack. Set `KAFKA_BOOTSTRAP_SERVERS` to
   an existing broker for push delivery and set `KAFKA_CONSUMER_ENABLED=true`
   to deliver Kafka messages to WebSocket clients.
 - SendGrid, Termii, and Kafka configuration defaults are placeholders and must
   be replaced before production use.
 - There is no migration framework. Existing databases need the `notification`
-  table created manually because `AUTO_CREATE_TABLES` only creates missing
-  tables on a fresh database. If an earlier schema exists, drop the unused
-  `release_after` column manually.
+  and `outbox` tables created manually because `AUTO_CREATE_TABLES` only
+  creates missing tables on a fresh database. If an earlier schema exists, drop
+  the unused `release_after` column manually.
 
 ## License
 

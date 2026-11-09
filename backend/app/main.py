@@ -22,6 +22,7 @@ from app.redis_config import create_redis_client
 from app.services.notification.model import Notification  # noqa: F401
 from app.services.notification.pub_sub.kafka import KafkaConsumer
 from app.services.notification.ws import router as notification_ws_router
+from app.services.outbox.model import Outbox  # noqa: F401
 from app.services.student.model import Student  # noqa: F401
 from app.services.student.router.student import router as student_router
 

@@ -6,7 +6,7 @@ import hmac
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import jwt
 from pwdlib import PasswordHash
@@ -14,6 +14,9 @@ from pwdlib import PasswordHash
 from app.base_config import Settings
 
 password_hasher = PasswordHash.recommended()
+
+REFRESH_COOKIE_NAME = "refresh"
+REFRESH_PATH = "/auth/api/v1/token-refresh"
 
 _DURATION_PATTERN = re.compile(r"^(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>ms|s|m|h|d|w)?$")
 _DURATION_UNITS = {
@@ -141,3 +144,18 @@ def unsign_cookie_value(signed_value: str, secret: str) -> str | None:
         return None
 
     return unsigned
+
+
+def build_refresh_cookie(refresh_token: str, settings: Settings) -> str:
+    """Build the signed refresh-token ``Set-Cookie`` header value."""
+
+    cookie_value = quote(
+        sign_cookie_value(refresh_token, settings.cookie_secret),
+        safe="",
+    )
+    return (
+        f"{REFRESH_COOKIE_NAME}={cookie_value}; "
+        "HttpOnly; Secure; SameSite=Strict; "
+        f"Path={REFRESH_PATH}; "
+        f"Max-Age={settings.refresh_token_max_age_seconds}"
+    )

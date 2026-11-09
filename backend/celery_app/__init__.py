@@ -13,10 +13,12 @@ TASK_QUEUE = "task"
 TASK_DLQ = "task.dlq"
 TASK_DLX = "task.dlx"
 TASK_RETRY = "task.retry"
+TASK_OUTBOX = "outbox.process_outbox"
 TASK_MAX_DELIVERIES = 5
 TASK_MAX_RETRIES = 5
 DLQ_MAX_RETRIES = 3
 TASK_RETRY_TTL_SECONDS = 300
+OUTBOX_SCHEDULE_SECONDS = 10.0
 
 # RabbitMQ adds these headers when it dead-letters a message. Republishing a
 # message with stale death history can trigger the broker's cycle detection.
@@ -81,7 +83,10 @@ retry_queue = Queue(
 celery_app = Celery(
     "coursewave",
     broker=settings.rabbitmq_url,
-    imports=("app.services.notification.task.process_notification",),
+    imports=(
+        "app.services.notification.task.process_notification",
+        "app.services.outbox.task.process_outbox",
+    ),
 )
 
 celery_app.conf.update(
@@ -107,6 +112,16 @@ celery_app.conf.update(
         "notification.process_notification": {
             "queue": TASK_QUEUE,
             "routing_key": TASK_QUEUE,
+        },
+        TASK_OUTBOX: {
+            "queue": TASK_QUEUE,
+            "routing_key": TASK_QUEUE,
+        },
+    },
+    beat_schedule={
+        "process-outbox-every-10-seconds": {
+            "task": TASK_OUTBOX,
+            "schedule": OUTBOX_SCHEDULE_SECONDS,
         },
     },
 )

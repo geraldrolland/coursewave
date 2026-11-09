@@ -13,7 +13,8 @@ DEFAULT_AUTH_EXCLUDE_PATHS = (
     "/student/api/v1/register,"
     "/student/api/v1/email,"
     "/student/api/v1/password-reset,"
-    "/student/api/v1/verify-email"
+    "/student/api/v1/verify-email,"
+    "/student/api/v1/google"
 )
 
 DEFAULT_RATELIMIT_ROUTES: list[dict[str, Any]] = [
@@ -56,6 +57,10 @@ class Settings(BaseSettings):
     termii_sender_id: str = "TERMII_SENDER_ID_PLACEHOLDER"
     termii_channel: str = "generic"
     termii_message_type: str = "plain"
+
+    google_client_id: str = "GOOGLE_CLIENT_ID_PLACEHOLDER"
+    google_client_secret: str = "GOOGLE_CLIENT_SECRET_PLACEHOLDER"
+    google_redirect_uri: str = "GOOGLE_REDIRECT_URI_PLACEHOLDER"
 
     jwt_secret: str = "change-me-in-production"
     cookie_secret: str = "change-me-in-production"

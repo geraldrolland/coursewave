@@ -3,7 +3,6 @@
 import logging
 from collections.abc import Callable
 from http.cookies import CookieError, SimpleCookie
-from urllib.parse import quote
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -14,17 +13,16 @@ from starlette.types import ASGIApp
 
 from app.base_config import Settings
 from app.security import (
+    REFRESH_COOKIE_NAME,
+    REFRESH_PATH,
+    build_refresh_cookie,
     create_access_token,
     create_refresh_token,
     decode_token,
-    sign_cookie_value,
     unsign_cookie_value,
 )
 
 logger = logging.getLogger("backend.refresh")
-
-REFRESH_PATH = "/auth/api/v1/token-refresh"
-REFRESH_COOKIE_NAME = "refresh"
 
 MISSING_REFRESH_TOKEN = "Missing refresh token"
 INVALID_REFRESH_TOKEN = "Invalid or expired refresh token"
@@ -108,21 +106,10 @@ class RefreshTokenMiddleware(BaseHTTPMiddleware):
             logger.exception("Unexpected failure while refreshing a token")
             return self._reject(500, REFRESH_FAILED)
 
-        cookie_value = quote(
-            sign_cookie_value(refresh_token, self.settings.cookie_secret),
-            safe="",
-        )
-        max_age = self.settings.refresh_token_max_age_seconds
+        cookie_value = build_refresh_cookie(refresh_token, self.settings)
 
         response = JSONResponse(content={"accessToken": access_token})
-        response.headers.append(
-            "set-cookie",
-            (
-                f"{REFRESH_COOKIE_NAME}={cookie_value}; "
-                "HttpOnly; Secure; SameSite=Strict; "
-                f"Path={REFRESH_PATH}; Max-Age={max_age}"
-            ),
-        )
+        response.headers.append("set-cookie", cookie_value)
         return response
 
     @staticmethod

@@ -25,6 +25,7 @@ logger = logging.getLogger("notification.provider.email")
 EMAIL_SUBJECT_REGISTRY = {
     "email_verification": "verify your email",
     "otp": "your verification code",
+    "forgot_password": "reset your password",
 }
 
 

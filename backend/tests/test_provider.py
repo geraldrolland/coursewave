@@ -434,3 +434,7 @@ def test_email_provider_requires_a_recipient() -> None:
 
     with pytest.raises(ProviderError, match="recipient"):
         provider.process(notification)
+
+
+def test_forgot_password_email_subject_is_registered() -> None:
+    assert EMAIL_SUBJECT_REGISTRY["forgot_password"] == "reset your password"

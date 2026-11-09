@@ -11,7 +11,11 @@ x-backend-environment: &backend-environment
   ACCESS_TOKEN_EXPIRY: "7m"
   REFRESH_TOKEN_EXPIRY: "7d"
   REFRESH_TOKEN_MAX_AGE_SECONDS: "604800"
-  AUTH_EXCLUDE_PATHS: "/health,/auth/api/v1/token-refresh,/student/api/v1/login,/student/api/v1/register,/student/api/v1/email,/student/api/v1/password-reset,/student/api/v1/verify-email"
+  AUTH_EXCLUDE_PATHS: "/health,/auth/api/v1/token-refresh,/student/api/v1/login,/student/api/v1/register,/student/api/v1/email,/student/api/v1/password-reset,/student/api/v1/verify-email,/student/api/v1/google"
+
+  GOOGLE_CLIENT_ID: "${GOOGLE_CLIENT_ID:-GOOGLE_CLIENT_ID_PLACEHOLDER}"
+  GOOGLE_CLIENT_SECRET: "${GOOGLE_CLIENT_SECRET:-GOOGLE_CLIENT_SECRET_PLACEHOLDER}"
+  GOOGLE_REDIRECT_URI: "${GOOGLE_REDIRECT_URI:-GOOGLE_REDIRECT_URI_PLACEHOLDER}"
 
   CORS_ORIGIN: "*"
   CORS_METHODS: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
@@ -148,6 +152,30 @@ services:
       - worker
       - --loglevel=INFO
       - --queues=task
+    environment: *backend-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - coursewave
+
+  beat:
+    image: coursewave-backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - celery_app
+      - beat
+      - --loglevel=INFO
+      - --schedule=/tmp/celerybeat-schedule
     environment: *backend-environment
     depends_on:
       redis:

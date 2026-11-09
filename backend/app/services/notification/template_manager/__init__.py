@@ -15,6 +15,7 @@ class TemplateType(str, Enum):
 
     OTP = "otp"
     EMAIL_VERIFICATION = "email_verification"
+    FORGOT_PASSWORD = "forgot_password"
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,10 @@ template_registery: dict[TemplateType, dict[str, str]] = {
     },
     TemplateType.EMAIL_VERIFICATION: {
         "template_dir": "templates/email/email_verification",
+        "template": "v1.html",
+    },
+    TemplateType.FORGOT_PASSWORD: {
+        "template_dir": "templates/email/forgot_password",
         "template": "v1.html",
     },
 }

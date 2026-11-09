@@ -17,9 +17,30 @@ def test_template_registry_covers_supported_types() -> None:
     assert set(template_registery) == {
         TemplateType.OTP,
         TemplateType.EMAIL_VERIFICATION,
+        TemplateType.FORGOT_PASSWORD,
     }
     for config in template_registery.values():
         assert set(config) == {"template_dir", "template"}
+
+
+def test_get_template_renders_forgot_password_link() -> None:
+    manager = TemplateManager(
+        "forgot_password",
+        {"link": "https://example.com/forgot-password?token=abc"},
+    )
+
+    result = manager.get_template()
+
+    assert result.version_number == 1
+    assert result.template_path == (
+        "templates/email/forgot_password/v1.html"
+    )
+    assert (
+        '<a href="https://example.com/forgot-password?token=abc">'
+        "Reset password</a>"
+        in result.body
+    )
+    assert "<!DOCTYPE html>" in result.body
 
 
 def test_get_template_renders_email_verification_link() -> None:
