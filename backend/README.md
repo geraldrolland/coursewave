@@ -26,6 +26,18 @@ directly.
 - Authenticated WebSocket notifications at `/notification`.
 - A four-minute Redis cache that skips already-processed notifications.
 - PostgreSQL access through an async request-scoped SQLModel session.
+- MinIO-backed profile-picture storage with multipart profile updates and
+  public-read picture URLs.
+- Instructor account, profile, education, experience, and payment-information
+  models with email verification, optional 2FA, email/Google auth, JSON
+  expertise, and degree enums, plus registration, login, OTP verification and
+  resend, email verification, password reset, Google login, current-session, and
+  logout routes.
+- Non-null `role` fields on student and instructor accounts and a shared Redis
+  session contract of `{"id": "...", "email": "...", "role": "..."}`.
+- An instructor verification model with JSON identity/academic payloads and a
+  pending/verified/rejected status.
+- Student account suspension and verification flags, both defaulting to false.
 
 ## Project Structure
 
@@ -53,6 +65,22 @@ backend/
 │   │   └── request_logger.py
 │   ├── redis_config/
 │   └── services/
+│       ├── instructor/
+│       │   ├── model/
+│       │   │   ├── education.py
+│       │   │   ├── experience.py
+│       │   │   ├── instructor.py
+│       │   │   ├── payment_info.py
+│       │   │   └── profile.py
+│       │   ├── router/
+│       │   │   ├── __init__.py
+│       │   │   ├── instructor.py
+│       │   │   └── profile.py
+│       │   ├── schema/
+│       │   │   └── __init__.py
+│       │   ├── google.py
+│       │   └── utils/
+│       │       └── __init__.py
 │       ├── notification/
 │       │   ├── exception/
 │       │   ├── model/
@@ -83,11 +111,18 @@ backend/
 │       │   │   └── outbox.py
 │       │   └── task/
 │       │       └── process_outbox.py
-│       └── student/
-│           ├── exception/
-│           ├── model/
-│           ├── router/
-│           └── schema/
+│       ├── storage/
+│       │   └── minio.py
+│       ├── student/
+│       │   ├── exception/
+│       │   ├── model/
+│       │   ├── router/
+│       │   ├── schema/
+│       │   └── utils/
+│       └── verification/
+│           └── model/
+│               ├── __init__.py
+│               └── verification.py
 ├── celery_app/
 │   ├── __init__.py
 │   └── task_registry.py
@@ -113,7 +148,7 @@ backend/
 ### Prerequisites
 
 - Python 3.12+
-- PostgreSQL, Redis, and RabbitMQ when running outside Docker Compose
+- PostgreSQL, Redis, RabbitMQ, and MinIO when running outside Docker Compose
 
 ### Installation
 
@@ -159,6 +194,12 @@ Copy-Item .env.example .env
 | `AUTO_CREATE_TABLES` | Create missing SQLModel tables at startup | `false` |
 | `DATABASE_URL` | Optional SQLAlchemy database URL override | `postgresql+asyncpg://postgres:user123@localhost:5432/coursewave_db` |
 | `RABBITMQ_URL` | Broker URL used by the Celery worker | `amqp://guest:guest@localhost:5672/` |
+| `MINIO_ENDPOINT` | MinIO API address used by the backend | `localhost:9000` |
+| `MINIO_PUBLIC_URL` | Public base URL embedded in profile-picture URLs | `http://localhost:9000` |
+| `MINIO_ACCESS_KEY` | MinIO access key | `coursewave` |
+| `MINIO_SECRET_KEY` | MinIO secret key | `coursewave-secret` |
+| `MINIO_BUCKET` | Bucket for uploaded profile pictures | `profilepics` |
+| `MINIO_SECURE` | Use HTTPS when connecting to MinIO | `false` |
 | `SENDGRID_API_KEY` | SendGrid API key used by the email provider | `SENDGRID_API_KEY_PLACEHOLDER` |
 | `SENDGRID_FROM_EMAIL` | Verified sender address used by the email provider | `no-reply@coursewave.example` |
 | `SENDGRID_FROM_NAME` | Sender display name used by the email provider | `CourseWave` |
@@ -199,15 +240,24 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-Compose starts six services:
+Compose starts nine services:
 
 - `coursewave` - this API, published on `http://localhost:3000`
 - `worker` - the Celery worker consuming the `task` queue
+- `beat` - the Celery Beat scheduler for the outbox dispatcher
 - `dlq-consumer` - the DLQ consumer that retries and finalizes failed tasks
 - `postgres` - PostgreSQL with the `coursewave_db` database
 - `redis` - sessions, cache, rate-limit counters, verification tokens, and
   notification locks
 - `rabbitmq` - broker with the management UI on `http://localhost:15672`
+- `minio` - profile-picture object storage with the API on
+  `http://localhost:9000` and console on `http://localhost:9001`
+- `minio-init` - one-shot setup that creates the `profilepics` bucket and marks
+  it publicly readable, then exits
+
+The backend waits for `minio-init` to complete successfully before starting.
+Compose uses `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` for the MinIO root
+credentials, defaulting to `coursewave` and `coursewave-secret`.
 
 ## Middleware
 
@@ -252,11 +302,16 @@ document such as:
 
 ```json
 {
-  "userId": "6f8c3e5e-3fbc-4f2e-8f19-3e0f6f8a9b21",
-  "role": "student",
-  "email": "ada@example.com"
+  "id": "6f8c3e5e-3fbc-4f2e-8f19-3e0f6f8a9b21",
+  "email": "ada@example.com",
+  "role": "student"
 }
 ```
+
+Sessions contain exactly these three fields. Both services write the same
+shape: `role` is `student` or `instructor`, and `id` is the student or
+instructor UUID. Legacy sessions that only contain `userId` are not recognized
+and must be recreated by logging in again.
 
 The parsed document is stored in the request state as `user`. Redis errors
 return `500` and missing or invalid sessions return `401`. Public paths are
@@ -324,8 +379,8 @@ receive an `X-Cache` header. Prefixes match complete path segments, so
 
 ## Rate Limiting
 
-Rate limits are keyed by the session `userId` for authenticated requests and by
-the socket IP for anonymous requests.
+Rate limits are keyed by the session `id` for authenticated requests and by the
+socket IP for anonymous requests.
 
 Routes are configured with `RATELIMIT_ROUTES`, a JSON list of dictionaries:
 
@@ -482,8 +537,7 @@ If the email is verified, the endpoint:
 
 1. Generates a UUID session ID.
 2. Stores `session:<session_id>` in Redis as
-   `{"userId": "...", "role": "student", "email": "..."}` with a 604800-second
-   TTL.
+   `{"id": "...", "email": "...", "role": "student"}` with a 604800-second TTL.
 3. Issues access and refresh JWTs.
 4. Sets the signed refresh cookie with `HttpOnly; Secure; SameSite=Strict`,
    `Path=/auth/api/v1/token-refresh`, and `Max-Age=604800`.
@@ -494,8 +548,9 @@ session ID.
 
 ## Google Authentication
 
-`GET /student/api/v1/google?code=...` is public and is intended to be the
-browser-facing OAuth callback.
+`GET /student/api/v1/google?code=...&state=...` is public and is intended to be
+the browser-facing OAuth callback. `state` is required and identifies the
+frontend path to use when authentication fails.
 
 The endpoint uses the configured Google credentials to:
 
@@ -517,7 +572,8 @@ dashboard can call `/auth/api/v1/token-refresh` to obtain an access token.
 
 Any failure, including a missing code, HTTP error, invalid userinfo response,
 database error, or Redis error, redirects with `302` to
-`{APP_HOST}/login?msg=google_authentication_failed`.
+`{APP_HOST}/{state}?msg=google_authentication_failed`. A request without
+`state` is rejected with `422`.
 
 ```env
 GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID_PLACEHOLDER
@@ -543,12 +599,485 @@ on `request.state.user` and returns:
 }
 ```
 
-The internal session field `userId` is exposed as `id`; the `role` field is not
-returned. No database lookup is performed. The endpoint is protected because it
-is not listed in `AUTH_EXCLUDE_PATHS`, so missing, invalid, expired, or
+The session's `id` and `email` values are returned directly; the `role` field is
+not returned. No database lookup is performed. The endpoint is protected because
+it is not listed in `AUTH_EXCLUDE_PATHS`, so missing, invalid, expired, or
 session-less tokens return `401`. A session document without non-empty string
-`userId` and `email` values also returns
+`id` and `email` values also returns
 `401 {"detail": "Invalid authentication session"}`.
+
+## Logout
+
+`POST /student/api/v1/logout` requires a Bearer access token.
+
+The endpoint decodes the access token, reads its `sessionId`, and deletes the
+matching `session:<sessionId>` key from Redis. It then returns:
+
+```json
+{
+  "message": "Logged out successfully"
+}
+```
+
+The response also sets the refresh cookie to an expired value:
+
+```text
+refresh=; HttpOnly; Secure; SameSite=Strict; Path=/auth/api/v1/token-refresh; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+```
+
+The cookie is cleared because it uses the same name and path. Missing, invalid,
+or expired access tokens are rejected by `AuthMiddleware` with `401`. A Redis
+failure while deleting the session returns
+`503 {"detail": "Logout service unavailable"}` and does not claim success.
+
+## Get Profile
+
+`GET /student/api/v1/profile` requires a Bearer access token and returns the
+authenticated student's profile:
+
+```json
+{
+  "first_name": "Ada",
+  "last_name": "Lovelace",
+  "email": "ada@example.com",
+  "profile_pic_url": "http://localhost:9000/profilepics/6f0d...d4.png"
+}
+```
+
+`profile_pic_url` is `null` until a picture has been uploaded. The student is
+resolved from the session `id`, so this endpoint only returns the caller's own
+profile. Missing or invalid sessions return `401`, and a session whose student
+no longer exists returns `404 {"detail": "Student not found"}`.
+
+## Profile Update
+
+`PATCH /student/api/v1/profile` requires a Bearer access token and accepts
+`multipart/form-data`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `first_name` | No | New first name, trimmed, 1-100 characters |
+| `middlename` | No | New middle name, trimmed, 1-100 characters; stored as `middle_name` |
+| `profile_pic` | No | JPEG or PNG image smaller than 5 MB |
+
+At least one of `first_name`, `middlename`, or `profile_pic` must be provided;
+an empty request returns `422`. The form field is `middlename` without an
+underscore, while the response uses `middle_name`.
+
+```bash
+curl -X PATCH http://localhost:3000/student/api/v1/profile \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -F "first_name=Grace" \
+  -F "middlename=Brewster" \
+  -F "profile_pic=@avatar.png"
+```
+
+Profile pictures must have a `.jpg`, `.jpeg`, or `.png` extension
+(case-insensitive) and must be smaller than 5 MB. If the student has no existing
+picture, or the existing URL cannot be parsed, the endpoint normalizes the
+extension to lowercase, generates an object key as `<uuid>.<extension>`, and
+uploads the file to `MINIO_BUCKET`. If `profile_pic_url` already points to an
+object in the bucket, the endpoint extracts that object key and overwrites the
+same object, so the URL stays unchanged. The key is reused verbatim even when
+the new file has a different extension, and the upload's content type is stored
+with it. Compose makes the `profilepics` bucket publicly readable so these URLs
+do not expire.
+
+On success, the endpoint returns:
+
+```json
+{
+  "user_id": "5a4c5f54-03a5-4a71-9a86-0b25f4d9c1a2",
+  "first_name": "Grace",
+  "middle_name": "Brewster",
+  "last_name": "Lovelace",
+  "email": "ada@example.com",
+  "profile_pic_url": "http://localhost:9000/profilepics/6f0d...d4.png"
+}
+```
+
+The upload happens before the database commit. Replacing an existing picture
+does not delete an old object because the existing key is overwritten. If the
+upload fails, the endpoint returns
+`503 {"detail": "Profile picture service unavailable"}` without changing the
+student. If the commit fails, the transaction is rolled back; a newly generated
+object is removed, while an overwritten existing object is left in place so the
+stored URL remains usable. Uploads without a new picture leave
+`profile_pic_url` unchanged.
+
+## Instructor Models
+
+The instructor service defines five SQLModel tables and public registration,
+login, OTP, Google, email-verification, password-reset, session, and logout
+routes.
+
+- `instructor`: UUID `instructor_id`, required unique `email`, a non-null
+  `role` defaulting to `instructor`, email-verification and 2FA flags defaulting
+  to `false`, nullable `password_hash`, and `auth_method` defaulting to `email`
+  with `google` as the other supported value.
+- `instructor_profile`: UUID `profile_id`, unique foreign key `instructor_id`,
+  required names and profile fields, a `male`/`female` gender enum, required
+  JSON `expertise` such as `["tech", "science"]`, an integer `years_of_exp`,
+  optional `company`, a 1000-character `bio`, and nullable JSON `social_links`
+  containing entries such as `{"linkedin": "...", "x": "..."}`.
+- `education`: UUID `education_id`, unique foreign key `instructor_id`,
+  required `school` and `course`, a `doctorate`/`masters`/`bachelor`/
+  `associate`/`diploma` degree enum, and a required `graduate_at` in `MM/YYYY`
+  form.
+- `experience`: UUID `experience_id`, indexed foreign key `instructor_id`,
+  required `company_name`, `role`, and `started_at` in `MM/YYYY` form, a nullable
+  `ended_at` in `MM/YYYY` form, and `till_present` defaulting to `false`.
+- `payment_info`: UUID `payment_info_id`, unique foreign key `instructor_id`,
+  required `full_name`, `account_number`, and `bank`, and `version_num`
+  defaulting to `1`.
+
+The `education`, `experience`, and `payment_info` tables include the standard
+`created_at` and `updated_at` timestamps. `graduate_at`, `started_at`, and
+`ended_at` are stored as `MM/YYYY` strings. Model-level validation is
+intentionally omitted; callers are expected to validate input separately.
+
+## Instructor Profile Creation
+
+`POST /instructor/api/v1/profile` requires a Bearer access token and accepts
+`multipart/form-data`. An instructor can create only one profile; an existing
+profile returns `403 {"detail": "Instructor profile already exists"}`.
+
+Required fields:
+
+| Field | Description |
+|-------|-------------|
+| `first_name` | Required, trimmed, 1–100 characters |
+| `last_name` | Required, trimmed, 1–100 characters |
+| `gender` | `male` or `female` |
+| `country_of_residence` | Required, 1–100 characters |
+| `state` | Required, 1–100 characters |
+| `city` | Required, 1–100 characters |
+| `bio` | Required, 1–1000 characters |
+| `headline` | Required, 1–255 characters |
+| `profile_pic` | Required JPEG or PNG smaller than 5 MB |
+| `current_occupation` | Required, 1–255 characters |
+| `years_of_exp` | Required non-negative integer |
+| `expertise` | Required non-empty list of strings |
+
+Optional fields:
+
+- `middle_name`: trimmed, 1–100 characters when supplied.
+- `company`: trimmed, 1–255 characters when supplied.
+- `social_links`: JSON list of objects containing `linkedin` and/or `x` URLs.
+  When supplied, the list must be non-empty and every object must contain at
+  least one link.
+
+`expertise` and `social_links` accept either JSON-encoded form values or
+repeated form fields. For example:
+
+```text
+expertise=["tech","science"]
+social_links=[{"linkedin":"https://www.linkedin.com/in/ada","x":"https://x.com/ada"}]
+```
+
+The endpoint resolves the instructor from the authenticated session, rejects an
+existing profile, validates the upload, generates a UUID object key, uploads the
+picture to `MINIO_BUCKET`, and stores the public URL. Upload failures return
+`503 {"detail": "Profile picture service unavailable"}`. Commit failures roll
+back and delete the newly uploaded object on a best-effort basis.
+
+## Instructor Registration
+
+`POST /instructor/api/v1/register` is public. It creates an instructor account,
+persists an email verification notification, and writes a transactional outbox
+row so the notification is dispatched after the database commit.
+
+Request body:
+
+```json
+{
+  "email": "ada@example.com",
+  "password": "StrongPass1!",
+  "confirm_password": "StrongPass1!"
+}
+```
+
+The request schema rejects extra fields, normalizes the email by trimming and
+lowercasing it, and enforces the same password policy as student registration:
+8–128 characters with an uppercase letter, a lowercase letter, a number, and a
+special character. The two password fields must match.
+
+The endpoint:
+
+1. Hashes the password with Argon2.
+2. Generates a URL-safe verification token and stores it in Redis with the
+   instructor UUID as its value and a 120-second TTL.
+3. Builds `{APP_HOST}/email-verification?token={token}`, using the same
+   frontend path as student registration. A missing `http://`/`https://` scheme
+   is added automatically.
+4. Inserts the `Instructor` with `auth_method=EMAIL` and
+   `is_email_verified=False`.
+5. Inserts an email `Notification` with
+   `belongs_to=INSTRUCTOR`, `template_type=email_verification`,
+   `content={"link": ...}`, and `to_email`.
+6. Inserts an `Outbox` row with
+   `payload={"argument": {"notification_id": "..."}, "task_name": "process_notification"}`,
+   `table="notification"`, and `ref_id=<notification UUID>`.
+7. Commits the instructor, notification, and outbox rows in one transaction.
+
+Successful response (`201 Created`):
+
+```json
+{
+  "instructor_id": "6f8c3e5e-3fbc-4f2e-8f19-3e0f6f8a9b21",
+  "message": "Registration successful. Please verify your email."
+}
+```
+
+Errors:
+
+- `409 Conflict` when the email is already registered.
+- `422 Unprocessable Entity` when request validation fails.
+- `503 Service Unavailable` when Redis cannot store the verification token.
+
+If the database transaction fails after the Redis token is written, the token is
+deleted on a best-effort basis. No task is published directly from the request.
+
+The `student` table also includes a non-null `role` column defaulting to
+`student`. Instructor email verification is completed through
+`PATCH /instructor/api/v1/verify-email`.
+
+## Instructor Login
+
+`POST /instructor/api/v1/login` is public.
+
+Request body:
+
+```json
+{
+  "email": "ada@example.com",
+  "password": "StrongPass1!"
+}
+```
+
+The request schema rejects extra fields and normalizes the email by trimming and
+lowercasing it. Unknown emails, accounts without a password hash, and incorrect
+passwords all return `401 {"detail": "Invalid email or password"}`.
+
+If the email is not verified, the endpoint creates a fresh 120-second
+verification token, queues another email verification notification and outbox
+row, and returns
+`403 {"detail": "Email is not verified. A verification email has been sent."}`.
+
+When 2FA is disabled, a successful login stores `session:<session_id>` as
+`{"id": "...", "email": "...", "role": "instructor"}` with a 604800-second TTL,
+sets the signed refresh cookie, and returns:
+
+```json
+{
+  "accessToken": "..."
+}
+```
+
+When `is_2fa_enabled` is true, the endpoint:
+
+1. Generates a zero-padded six-digit OTP code.
+2. Hashes the code with Argon2 and generates an opaque challenge token.
+3. Stores the token in Redis for 24 hours with a JSON value containing the
+   instructor UUID, the code hash, and the code expiry:
+   `{"instructor_id": "...", "code_hash": "...", "exp": 1760000120}`.
+   `exp` is the current Unix time plus 120 seconds, so the code is logically
+   valid for two minutes even though the challenge token remains for 24 hours.
+4. Inserts an email `Notification` with `belongs_to=INSTRUCTOR`,
+   `template_type=otp`, `content={"otp_code": "..."}`, and `to_email`. The
+   plaintext code is sent by email and is never stored in Redis.
+5. Inserts an `Outbox` row and commits the notification and outbox together.
+6. Redirects with `302` to
+   `{APP_HOST}/otp-verification?token={token}`.
+
+No login session or refresh cookie is created during the 2FA challenge. Redis
+failures while creating a session or OTP challenge return
+`503 {"detail": "Authentication service unavailable"}`. Redis failures while
+resending email verification return
+`503 {"detail": "Email verification service unavailable"}`. If the notification
+transaction fails after the OTP token is written, the token is deleted on a
+best-effort basis and the transaction is rolled back.
+
+## Instructor OTP Verification
+
+`POST /instructor/api/v1/verify-otp` is public and completes a 2FA challenge.
+
+Request body:
+
+```json
+{
+  "code": "012345",
+  "token": "otp-challenge-token"
+}
+```
+
+`code` must be exactly six digits, and `token` is trimmed before lookup. The
+endpoint reads the challenge from Redis and verifies the submitted code against
+`code_hash` with Argon2. A missing or malformed challenge returns
+`400 {"detail": "Invalid or expired OTP token"}`. A challenge whose `exp` is in
+the past returns `403 {"detail": "Invalid or expired OTP token"}` and is kept in
+Redis so it can be replaced through the resend endpoint. An incorrect code
+returns `400 {"detail": "Invalid OTP code"}` without consuming the challenge; an
+unknown instructor returns `404 {"detail": "Instructor not found"}`.
+
+On success the challenge is deleted before the login session is created, so it
+cannot be replayed. The endpoint then stores
+`{"id": "...", "email": "...", "role": "instructor"}`, sets the signed refresh
+cookie, and returns `200 {"accessToken": "..."}` without redirecting. Redis
+failures return `503 {"detail": "Authentication service unavailable"}`.
+
+## Instructor OTP Resend
+
+`POST /instructor/api/v1/resend-otp` is public.
+
+Request body:
+
+```json
+{
+  "token": "otp-challenge-token"
+}
+```
+
+A missing or malformed challenge returns
+`403 {"detail": "otp verification session expired"}`. A challenge that has not
+expired returns `403 {"detail": "OTP has not expired"}` without changing the
+stored code. Once `exp` is in the past, the endpoint generates and hashes a new
+six-digit code, overwrites the same token with
+`{"instructor_id": "...", "code_hash": "...", "exp": now + 120}`, sets a
+24-hour TTL, queues a new `otp` email notification and outbox row in one
+transaction, and returns `200 {"message": "OTP resent successfully"}`. An
+unknown instructor returns `404 {"detail": "Instructor not found"}`; Redis
+failures return `503 {"detail": "Authentication service unavailable"}`.
+
+## Instructor Google Authentication
+
+`GET /instructor/api/v1/google?code=...&state=...` is public and is the
+browser-facing instructor OAuth callback. It exchanges the code and fetches the
+Google userinfo using instructor-local helpers. If no instructor exists, a new
+one is created with `is_email_verified=true`, `auth_method=google`, the default
+`instructor` role, and no password hash. Existing unverified instructors are
+marked verified without changing their `auth_method`.
+
+When 2FA is enabled, Google login creates the same hashed OTP challenge as
+password login and redirects to `{APP_HOST}/otp-verification?token=...`; no
+session or refresh cookie is created. Otherwise it creates the instructor
+session, sets the signed refresh cookie, and redirects to
+`{APP_HOST}/dashboard`.
+
+Any failure, including a missing code, HTTP error, invalid userinfo response,
+database error, or Redis error, redirects with `302` to
+`{APP_HOST}/{state}?msg=google_authentication_failed`. A request without
+`state` is rejected with `422`.
+
+## Instructor Current Session
+
+`GET /instructor/api/v1/me` requires a Bearer access token and returns the
+authenticated instructor's Redis session identity:
+
+```json
+{
+  "id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+  "email": "ada@example.com"
+}
+```
+
+The `role` field is not returned. No database lookup is performed. Missing,
+invalid, or incomplete sessions return `401`, including a session without
+non-empty string `id` and `email` values or a legacy session that only contains
+`userId`.
+
+## Instructor Logout
+
+`POST /instructor/api/v1/logout` requires a Bearer access token. It deletes
+`session:<sessionId>`, clears the refresh cookie with `Max-Age=0`, and returns
+`200 {"message": "Logged out successfully"}`. Redis failures return
+`503 {"detail": "Logout service unavailable"}` and do not claim success.
+
+## Instructor Email Verification
+
+`PATCH /instructor/api/v1/verify-email` is public.
+
+Request body:
+
+```json
+{
+  "token": "verification-token"
+}
+```
+
+The token is read from Redis and resolved to an instructor UUID. Invalid or
+expired tokens return `400 {"detail": "Invalid or expired verification token"}`;
+a missing instructor returns `404 {"detail": "Instructor not found"}`. On
+success the instructor's `is_email_verified` flag is set to true, the token is
+deleted, and the endpoint returns
+`200 {"message": "Email verified successfully"}`. Already-verified accounts
+receive the same response. Redis failures return `503`.
+
+## Instructor Password Reset
+
+### Request a reset email
+
+`POST /instructor/api/v1/email` is public.
+
+Request body:
+
+```json
+{
+  "email": "ada@example.com"
+}
+```
+
+The endpoint always returns
+`200 {"message": "If the email is registered, a password reset link has been sent."}`
+to avoid account enumeration. When the instructor exists, it generates a
+300-second (5-minute) token, builds `{APP_HOST}/forgot-password?token={token}`,
+and queues a `forgot_password` notification plus outbox row.
+
+### Reset the password
+
+`PATCH /instructor/api/v1/password-reset` is public.
+
+Request body:
+
+```json
+{
+  "password": "NewStrong2!",
+  "confirm_password": "NewStrong2!",
+  "token": "password-reset-token"
+}
+```
+
+Passwords follow the same policy as registration and must match. Invalid or
+expired tokens return
+`400 {"detail": "Invalid or expired password reset token"}`; a missing
+instructor returns `404 {"detail": "Instructor not found"}`. On success the new
+Argon2 hash is stored, the email is marked verified if necessary, the token is
+deleted, and the endpoint returns
+`200 {"message": "Password reset successfully"}`. Redis failures return
+`503 {"detail": "Password reset service unavailable"}`.
+
+## Student Account Flags
+
+The `student` table includes `is_suspended` and `is_verified`. Both are non-null
+booleans that default to `false`. No route currently changes or enforces them.
+
+## Verification Model
+
+The verification service defines one SQLModel table, `verification`. No
+verification routes are exposed yet.
+
+- UUID `id` primary key
+- Required indexed foreign key `instructor_id` → `instructor.instructor_id`
+- Required JSON `id_verification` and `academic_verification` objects
+- `status` enum with `pending`, `verified`, and `rejected` values; defaults to
+  `pending`
+- Nullable `verified_at` datetime and `verified_by` UUID
+- Nullable `rejected_reason` stored as SQL `Text`
+- Standard `created_at` and `updated_at` timestamps
+
+`verified_by` currently has no database foreign key because no Admin model
+exists yet. It is ready to become a FK once one is added. Model-level validation
+is intentionally omitted.
 
 ## Email Verification
 
@@ -585,8 +1114,8 @@ Request body:
 The endpoint always returns
 `200 {"message": "If the email is registered, a password reset link has been sent."}`
 to avoid account enumeration. When the student exists, it generates a
-120-second token, builds `{APP_HOST}/forgot-password?token={token}`, and queues a
-`forgot_password` notification plus outbox row.
+300-second (5-minute) token, builds `{APP_HOST}/forgot-password?token={token}`,
+and queues a `forgot_password` notification plus outbox row.
 
 ### Reset the password
 
@@ -653,7 +1182,7 @@ used by `get_template()`. `version_number` is derived from the pinned filename,
 so `v1.html` returns `1`. Template paths are resolved relative to `backend/`.
 
 The email verification and forgot-password templates render `{{ link }}` as the
-`href` value. The OTP template renders `{{ otp }}` in its message body.
+`href` value. The OTP template renders `{{ otp_code }}` in its message body.
 `template_build()` is the static Jinja rendering helper used by
 `get_template()`.
 
@@ -734,7 +1263,7 @@ session in `websocket.state.user`.
 - Invalid or missing tokens and missing sessions close with code `1008`.
 - Redis failures and malformed stored sessions close with code `1011`.
 
-`WebsocketNotificationManager` tracks multiple sockets per `userId` and sends
+`WebsocketNotificationManager` tracks multiple sockets per user ID and sends
 messages only to sockets whose client state is connected. Failed sockets are
 removed automatically.
 
@@ -890,9 +1419,9 @@ logged, throttled for five seconds, and rejected with `requeue=True`. The
 consumer enables publisher confirms and acknowledges only after the retry
 publish succeeds or the terminal handler commits.
 
-Registration is the current outbox producer. Other features can insert an
-`Outbox` row in the same transaction as their business write and let the Beat
-job dispatch the registered task.
+Student and instructor registration are the current outbox producers. Other
+features can insert an `Outbox` row in the same transaction as their business
+write and let the Beat job dispatch the registered task.
 
 ## API
 
@@ -900,9 +1429,23 @@ job dispatch the registered task.
 |--------|------|-------------|----------------|
 | `GET` | `/health` | Health check | Public |
 | `POST` | `/student/api/v1/register` | Register a student | Public |
+| `POST` | `/instructor/api/v1/register` | Register an instructor | Public |
+| `POST` | `/instructor/api/v1/login` | Log in or start instructor 2FA | Public |
+| `POST` | `/instructor/api/v1/verify-otp` | Verify an instructor OTP challenge | Public |
+| `POST` | `/instructor/api/v1/resend-otp` | Replace an expired instructor OTP challenge | Public |
+| `GET` | `/instructor/api/v1/google` | Log in with a Google OAuth code and state | Public |
+| `GET` | `/instructor/api/v1/me` | Return the current instructor session identity | Bearer token |
+| `POST` | `/instructor/api/v1/logout` | Delete the instructor session and clear the refresh cookie | Bearer token |
+| `PATCH` | `/instructor/api/v1/verify-email` | Verify an instructor email address | Public |
+| `POST` | `/instructor/api/v1/email` | Request an instructor password-reset email | Public |
+| `PATCH` | `/instructor/api/v1/password-reset` | Reset an instructor password | Public |
+| `POST` | `/instructor/api/v1/profile` | Create the authenticated instructor's profile | Bearer token |
 | `POST` | `/student/api/v1/login` | Log in and issue tokens | Public |
-| `GET` | `/student/api/v1/google` | Log in with a Google OAuth code | Public |
+| `GET` | `/student/api/v1/google` | Log in with a Google OAuth code and state | Public |
 | `GET` | `/student/api/v1/me` | Return the current session identity | Bearer token |
+| `POST` | `/student/api/v1/logout` | Delete the session and clear the refresh cookie | Bearer token |
+| `GET` | `/student/api/v1/profile` | Return the current student's profile | Bearer token |
+| `PATCH` | `/student/api/v1/profile` | Update names and replace the profile picture | Bearer token |
 | `PATCH` | `/student/api/v1/verify-email` | Verify an email address | Public |
 | `POST` | `/student/api/v1/email` | Request a password-reset email | Public |
 | `PATCH` | `/student/api/v1/password-reset` | Reset a password | Public |
@@ -916,12 +1459,23 @@ job dispatch the registered task.
 .venv\Scripts\python -m pytest
 ```
 
-The suite covers authentication, login and token issuance, Google OAuth,
-current-session identity, email verification, password reset, CORS, caching,
-rate limiting, refresh-token rotation, request logging, PostgreSQL
-configuration, session cleanup, registration validation, password hashing,
-Redis token creation, duplicate-email handling, student auth-method defaults,
-notification model defaults, Celery queue topology, lock
+The suite covers authentication, login and token issuance, Google OAuth and
+required state-based failure redirects, current-session identity, logout and
+refresh-cookie clearing, profile lookup, profile name updates, profile-picture
+validation and UUID object keys, MinIO upload and overwrite behavior, instructor
+account/profile/education/experience/payment model defaults and constraints,
+instructor registration validation, instructor login and 2FA OTP challenges,
+instructor OTP verification and resend, code hashing and expiry/TTL behavior,
+instructor Google login and 2FA redirects, instructor email verification,
+instructor password reset, instructor profile creation and picture upload,
+instructor current-session and logout routes, role defaults and the shared
+session contract,
+token TTL and cleanup, duplicate-email, Redis and transaction failure handling,
+verification model defaults and constraints, student suspension/verification
+defaults, storage failure handling, email verification, password reset, CORS,
+caching, rate limiting, refresh-token rotation, request logging, PostgreSQL
+configuration, session cleanup, password hashing, Redis token creation, student
+auth-method defaults, notification model defaults, Celery queue topology, lock
 handling, retry behavior, outbox dispatch and retry budgeting, DLQ republish and
 terminal failure handling, provider dispatch, email template rendering, SendGrid
 error handling, Kafka producer publishing, Kafka consumer dispatch and commits,
@@ -931,6 +1485,9 @@ processed-notification caching.
 ## Known Limitations
 
 - Password reset does not invalidate existing access or refresh sessions.
+- OTP challenges created before the hashed-challenge change use the old
+  plaintext `otp_code` payload and are rejected; affected instructors must log
+  in again.
 - There is no general-purpose notification enqueue endpoint. New producers
   should insert an `Outbox` row in the same transaction as their business
   write.
@@ -939,10 +1496,18 @@ processed-notification caching.
   to deliver Kafka messages to WebSocket clients.
 - SendGrid, Termii, and Kafka configuration defaults are placeholders and must
   be replaced before production use.
-- There is no migration framework. Existing databases need the `notification`
-  and `outbox` tables created manually because `AUTO_CREATE_TABLES` only
-  creates missing tables on a fresh database. If an earlier schema exists, drop
-  the unused `release_after` column manually.
+- There is no migration framework. Existing databases need the `notification`,
+  `outbox`, `instructor`, `instructor_profile`, `education`, `experience`,
+  `payment_info`, and `verification` tables created manually because
+  `AUTO_CREATE_TABLES` only creates missing tables on a fresh database. Existing
+  `student` tables also need `is_suspended` and `is_verified` boolean columns
+  added with `NOT NULL DEFAULT false`, plus a `role` column added with
+  `VARCHAR(20) NOT NULL DEFAULT 'student'`. Existing `instructor` tables need a
+  `role` column added with `VARCHAR(20) NOT NULL DEFAULT 'instructor'`. Existing
+  `instructor_profile` tables need `linkedin_url` dropped, nullable JSON
+  `social_links` added, `company` made nullable, and `bio` changed to
+  `VARCHAR(1000)`. If an earlier schema exists, drop the unused `release_after`
+  column manually.
 
 ## License
 

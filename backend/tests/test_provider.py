@@ -280,7 +280,7 @@ def test_email_provider_accepts_email_recipient_and_json_content(
     notification = make_notification(
         {
             "template_type": "otp",
-            "content": '{"otp": "123456"}',
+            "content": '{"otp_code": "123456"}',
             "email": "student@example.com",
         }
     )

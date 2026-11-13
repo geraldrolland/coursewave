@@ -8,7 +8,7 @@ from app.middleware.auth import (
     MISSING_AUTHORIZATION,
     SESSION_NOT_FOUND,
 )
-from app.services.student.router.student import INVALID_AUTH_SESSION
+from app.services.student.router import INVALID_AUTH_SESSION
 from tests.fakes import FakeRedis
 from tests.helpers import (
     TEST_USER,
@@ -74,9 +74,11 @@ def test_me_rejects_missing_session(
     "user",
     [
         {"role": "student", "email": "ada@example.com"},
-        {"userId": TEST_USER_ID, "role": "student"},
-        {"userId": "", "email": "ada@example.com"},
-        {"userId": 123, "email": "ada@example.com"},
+        {"role": "student", "email": "ada@example.com"},
+        {"id": TEST_USER_ID, "role": "student"},
+        {"id": "", "email": "ada@example.com"},
+        {"id": 123, "email": "ada@example.com"},
+        {"userId": TEST_USER_ID, "email": "ada@example.com"},
     ],
 )
 def test_me_rejects_incomplete_session(

@@ -16,9 +16,9 @@ TEST_COOKIE_SECRET = "test-cookie-secret-for-coursewave-tests-0123456789"
 TEST_SESSION_ID = "session-123"
 TEST_USER_ID = "user-123"
 TEST_USER = {
-    "userId": TEST_USER_ID,
-    "role": "student",
+    "id": TEST_USER_ID,
     "email": "ada@example.com",
+    "role": "student",
 }
 
 

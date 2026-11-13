@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.services.student.router.student import (
+from app.services.student.router import (
     EMAIL_VERIFICATION_UNAVAILABLE,
     INVALID_VERIFICATION_TOKEN,
     STUDENT_NOT_FOUND,

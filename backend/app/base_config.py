@@ -14,7 +14,15 @@ DEFAULT_AUTH_EXCLUDE_PATHS = (
     "/student/api/v1/email,"
     "/student/api/v1/password-reset,"
     "/student/api/v1/verify-email,"
-    "/student/api/v1/google"
+    "/student/api/v1/google,"
+    "/instructor/api/v1/register,"
+    "/instructor/api/v1/login,"
+    "/instructor/api/v1/verify-otp,"
+    "/instructor/api/v1/resend-otp,"
+    "/instructor/api/v1/google,"
+    "/instructor/api/v1/verify-email,"
+    "/instructor/api/v1/email,"
+    "/instructor/api/v1/password-reset"
 )
 
 DEFAULT_RATELIMIT_ROUTES: list[dict[str, Any]] = [
@@ -57,6 +65,13 @@ class Settings(BaseSettings):
     termii_sender_id: str = "TERMII_SENDER_ID_PLACEHOLDER"
     termii_channel: str = "generic"
     termii_message_type: str = "plain"
+
+    minio_endpoint: str = "localhost:9000"
+    minio_public_url: str = "http://localhost:9000"
+    minio_access_key: str = "coursewave"
+    minio_secret_key: str = "coursewave-secret"
+    minio_bucket: str = "profilepics"
+    minio_secure: bool = False
 
     google_client_id: str = "GOOGLE_CLIENT_ID_PLACEHOLDER"
     google_client_secret: str = "GOOGLE_CLIENT_SECRET_PLACEHOLDER"

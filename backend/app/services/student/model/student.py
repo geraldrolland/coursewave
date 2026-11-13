@@ -9,7 +9,6 @@ from sqlmodel import Field, SQLModel
 
 from app.services.student.model.base import utc_now
 
-
 class AuthMethod(str, Enum):
     """Supported student authentication methods."""
 
@@ -28,7 +27,10 @@ class Student(SQLModel, table=True):
     last_name: str = Field(max_length=100)
     password_hash: str | None = Field(default=None, max_length=255)
     email: str = Field(max_length=320, unique=True, index=True)
+    role: str = Field(default="student", max_length=20)
     is_email_verified: bool = Field(default=False)
+    is_suspended: bool = Field(default=False)
+    is_verified: bool = Field(default=False)
     auth_method: AuthMethod = Field(
         default=AuthMethod.EMAIL,
         sa_column=Column(

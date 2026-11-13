@@ -23,9 +23,7 @@ def client_identifier(scope: Scope) -> str:
     if isinstance(state, dict):
         user = state.get("user")
         if isinstance(user, dict):
-            user_id = user.get("userId")
-            if user_id is None:
-                user_id = user.get("user_id")
+            user_id = user.get("id")
             if user_id is not None and str(user_id):
                 return str(user_id)
 

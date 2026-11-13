@@ -80,9 +80,9 @@ async def authenticate_user(websocket: WebSocket) -> dict[str, Any]:
             reason="Authentication service unavailable",
         )
 
-    user_id = session.get("userId")
+    user_id = session.get("id")
     if not isinstance(user_id, str) or not user_id:
-        logger.error("Stored WebSocket session has no userId")
+        logger.error("Stored WebSocket session has no id")
         raise WebSocketException(
             code=status.WS_1011_INTERNAL_ERROR,
             reason="Authentication service unavailable",

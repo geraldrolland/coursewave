@@ -30,16 +30,16 @@ _DURATION_UNITS = {
 }
 
 
-def hash_password(password: str) -> str:
-    """Hash a plaintext password with Argon2."""
+def hash(value: str) -> str:
+    """Hash a plaintext value with Argon2."""
 
-    return password_hasher.hash(password)
+    return password_hasher.hash(value)
 
 
-def verify_password(password: str, password_hash: str) -> bool:
-    """Verify a plaintext password against a stored hash."""
+def verify_hash(value: str, hashed_value: str) -> bool:
+    """Verify a plaintext value against a stored Argon2 hash."""
 
-    return password_hasher.verify(password, password_hash)
+    return password_hasher.verify(value, hashed_value)
 
 
 def parse_duration(value: str | int | float) -> float:
@@ -158,4 +158,16 @@ def build_refresh_cookie(refresh_token: str, settings: Settings) -> str:
         "HttpOnly; Secure; SameSite=Strict; "
         f"Path={REFRESH_PATH}; "
         f"Max-Age={settings.refresh_token_max_age_seconds}"
+    )
+
+
+def build_clear_refresh_cookie() -> str:
+    """Build the expired ``Set-Cookie`` header that removes the refresh token."""
+
+    return (
+        f"{REFRESH_COOKIE_NAME}=; "
+        "HttpOnly; Secure; SameSite=Strict; "
+        f"Path={REFRESH_PATH}; "
+        "Max-Age=0; "
+        "Expires=Thu, 01 Jan 1970 00:00:00 GMT"
     )

@@ -65,7 +65,7 @@ def test_get_template_renders_email_verification_link() -> None:
 
 
 def test_get_template_accepts_enum_and_renders_otp() -> None:
-    manager = TemplateManager(TemplateType.OTP, {"otp": "123456"})
+    manager = TemplateManager(TemplateType.OTP, {"otp_code": "123456"})
 
     result = manager.get_template()
 
@@ -85,7 +85,7 @@ def test_template_build_returns_rendered_html() -> None:
 
 
 def test_template_is_frozen() -> None:
-    result = TemplateManager("otp", {"otp": "123456"}).get_template()
+    result = TemplateManager("otp", {"otp_code": "123456"}).get_template()
 
     with pytest.raises(FrozenInstanceError):
         result.body = "Changed"

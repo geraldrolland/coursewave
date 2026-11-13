@@ -26,7 +26,7 @@ async def notification_websocket(
     """Authenticate and keep a notification WebSocket open."""
 
     await websocket.accept()
-    user_id = str(user["userId"])
+    user_id = str(user["id"])
     websocket_notification_manager.register(user_id, websocket)
     logger.info("WebSocket connected for user %s", user_id)
 

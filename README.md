@@ -1,9 +1,9 @@
 # CourseWave
 
 CourseWave is a student platform built around a FastAPI backend, PostgreSQL,
-Redis, RabbitMQ, and Celery workers for asynchronous notification delivery.
-Kafka is used for push notification fan-out and authenticated WebSocket
-delivery through an external broker.
+Redis, RabbitMQ, MinIO, and Celery workers for asynchronous notification
+delivery. Kafka is used for push notification fan-out and authenticated
+WebSocket delivery through an external broker.
 
 ## Services
 
@@ -16,6 +16,8 @@ delivery through an external broker.
 | `postgres` | PostgreSQL 17 with `coursewave_db` | `5432` |
 | `redis` | Sessions, cache, rate limits, verification tokens, notification locks | `6379` |
 | `rabbitmq` | Task broker with quorum queues and a dead-letter queue | `5672`, `15672` |
+| `minio` | Profile-picture object storage and console | `9000`, `9001` |
+| `minio-init` | Creates the public-read `profilepics` bucket, then exits | - |
 
 ## Quick Start
 
@@ -30,11 +32,12 @@ at `http://localhost:3000/docs` and requires a Bearer access token.
 ## Backend
 
 See [`backend/README.md`](backend/README.md) for configuration, middleware
-behavior, registration, login, Google authentication, current-session lookup,
-email verification, password reset, the authentication and refresh-token
-contracts, the notification task flow and queue topology, email template
-rendering, notification providers, authenticated WebSocket notifications, and
-testing instructions.
+behavior, student and instructor registration, login, Google authentication,
+current-session lookup, logout, profile lookup and updates, MinIO-backed profile
+pictures, email verification, password reset, the authentication and
+refresh-token contracts, the notification task flow and queue topology, email
+template rendering, notification providers, authenticated WebSocket
+notifications, and testing instructions.
 
 ## Tests
 

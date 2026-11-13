@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
+from minio import Minio
 from redis.asyncio import Redis
 from sqlmodel import SQLModel
 from starlette.middleware.cors import CORSMiddleware
@@ -19,17 +20,33 @@ from app.middleware.ratelimit import RateLimitMiddleware
 from app.middleware.refresh_token import RefreshTokenMiddleware
 from app.middleware.request_logger import RequestLoggerMiddleware
 from app.redis_config import create_redis_client
+from app.services.instructor.model import (  # noqa: F401
+    Education,
+    Experience,
+    Instructor,
+    InstructorProfile,
+    PaymentInfo,
+)
+from app.services.instructor.router.instructor import (
+    router as instructor_router,
+)
+from app.services.instructor.router.profile import (
+    router as instructor_profile_router,
+)
 from app.services.notification.model import Notification  # noqa: F401
 from app.services.notification.pub_sub.kafka import KafkaConsumer
 from app.services.notification.ws import router as notification_ws_router
 from app.services.outbox.model import Outbox  # noqa: F401
+from app.services.storage.minio import create_minio_client
 from app.services.student.model import Student  # noqa: F401
-from app.services.student.router.student import router as student_router
+from app.services.student.router import router as student_router
+from app.services.verification.model import Verification  # noqa: F401
 
 
 def create_app(
     settings: Settings | None = None,
     redis_client: Redis | None = None,
+    minio_client: Minio | None = None,
 ) -> FastAPI:
     """Build and configure the FastAPI application."""
 
@@ -79,6 +96,7 @@ def create_app(
     )
     app.state.settings = settings
     app.state.redis = redis_client or create_redis_client(settings)
+    app.state.minio = minio_client or create_minio_client(settings)
 
     def redis_provider() -> Redis:
         """Resolve the current Redis client for middleware."""
@@ -90,6 +108,8 @@ def create_app(
         return {"status": "ok"}
 
     app.include_router(student_router)
+    app.include_router(instructor_router)
+    app.include_router(instructor_profile_router)
     app.include_router(notification_ws_router)
 
     # add_middleware is LIFO: the last added middleware runs first.

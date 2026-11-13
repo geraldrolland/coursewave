@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.base_dependencies import get_session
 from app.main import create_app
-from app.security import hash_password
+from app.security import hash
 from app.services.student.model import Student
 from tests.helpers import build_settings
 
@@ -24,6 +24,52 @@ class FakeScalarResult:
 
     def scalar_one_or_none(self) -> Any:
         return self.value
+
+
+class FakeMinio:
+    """In-memory MinIO client double for profile-picture tests."""
+
+    def __init__(self) -> None:
+        self.objects: dict[tuple[str, str], dict[str, Any]] = {}
+        self.uploads: list[dict[str, Any]] = []
+        self.deleted: list[tuple[str, str]] = []
+        self.upload_error: Exception | None = None
+        self.delete_error: Exception | None = None
+
+    def put_object(
+        self,
+        bucket_name: str,
+        object_name: str,
+        data: Any,
+        length: int,
+        content_type: str = "application/octet-stream",
+        **_: Any,
+    ) -> None:
+        if self.upload_error is not None:
+            raise self.upload_error
+
+        body = data.read()
+        record = {
+            "bucket": bucket_name,
+            "object_key": object_name,
+            "data": body,
+            "length": length,
+            "content_type": content_type,
+        }
+        self.objects[(bucket_name, object_name)] = record
+        self.uploads.append(record)
+
+    def remove_object(
+        self,
+        bucket_name: str,
+        object_name: str,
+        version_id: str | None = None,
+    ) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
+
+        self.deleted.append((bucket_name, object_name))
+        self.objects.pop((bucket_name, object_name), None)
 
 
 class FakeStudentSession:
@@ -86,7 +132,7 @@ def make_student(
     """Build a student with a real password hash by default."""
 
     if password_hash is None and password is not None:
-        password_hash = hash_password(password)
+        password_hash = hash(password)
 
     return Student(
         first_name="Ada",
@@ -101,9 +147,10 @@ def make_student(
 def student_client(
     session: FakeStudentSession,
     redis: Any,
+    minio_client: Any | None = None,
     **settings_overrides: Any,
 ) -> Iterator[TestClient]:
-    """Create an app with fake database and Redis dependencies."""
+    """Create an app with fake database, Redis, and MinIO dependencies."""
 
     settings = build_settings(
         auto_create_tables=False,
@@ -111,7 +158,11 @@ def student_client(
         rate_limit_enabled=False,
         **settings_overrides,
     )
-    app = create_app(settings, redis_client=redis)  # type: ignore[arg-type]
+    app = create_app(
+        settings,
+        redis_client=redis,
+        minio_client=minio_client,
+    )  # type: ignore[arg-type]
 
     async def override_get_session() -> AsyncIterator[FakeStudentSession]:
         yield session

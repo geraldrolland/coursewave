@@ -8,6 +8,7 @@ import httpx
 import jwt
 import pytest
 
+import app.services.student.router as student_router
 from app.base_config import Settings
 from app.security import unsign_cookie_value
 from app.services.student.google import (
@@ -15,14 +16,13 @@ from app.services.student.google import (
     GOOGLE_USERINFO_URL,
     GoogleAuthError,
     GoogleUserInfo,
-    exchange_code_for_access_token,
-    fetch_google_user_info,
 )
 from app.services.student.model import AuthMethod, Student
-from app.services.student.router import student as student_router
-from app.services.student.router.student import (
-    GOOGLE_AUTH_FAILED_PATH,
-    GOOGLE_AUTH_SUCCESS_PATH,
+from app.services.student.router import GOOGLE_AUTH_SUCCESS_PATH
+from app.services.student.utils import (
+    GOOGLE_AUTH_FAILED_MSG,
+    exchange_code_for_access_token,
+    fetch_google_user_info,
 )
 from tests.fakes import FakeRedis
 from tests.helpers import (
@@ -49,6 +49,12 @@ def google_settings() -> Settings:
         google_client_secret="test-google-client-secret",
         google_redirect_uri="http://localhost:3000/student/api/v1/google",
     )
+
+
+def google_failure_url(state: str = "login") -> str:
+    """Build the expected Google failure redirect URL."""
+
+    return f"http://localhost:3000/{state}?msg={GOOGLE_AUTH_FAILED_MSG}"
 
 
 def test_exchange_code_for_access_token_posts_expected_form() -> None:
@@ -252,7 +258,7 @@ def test_google_auth_logs_in_existing_verified_student(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": " auth-code "},
+            params={"code": " auth-code ", "state": "login"},
             follow_redirects=False,
         )
 
@@ -283,9 +289,9 @@ def test_google_auth_logs_in_existing_verified_student(
     session_key = f"session:{payload['sessionId']}"
     assert redis.values[session_key] == json.dumps(
         {
-            "userId": str(student.user_id),
-            "role": "student",
+            "id": str(student.user_id),
             "email": DEFAULT_EMAIL,
+            "role": "student",
         }
     )
     assert redis.ttls[session_key] == 604800
@@ -312,7 +318,7 @@ def test_google_auth_verifies_existing_unverified_student(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
@@ -334,7 +340,7 @@ def test_google_auth_creates_google_student(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
@@ -372,7 +378,7 @@ def test_google_auth_falls_back_to_name_and_email(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
@@ -402,7 +408,7 @@ def test_google_auth_uses_email_local_part_when_name_missing(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
@@ -419,12 +425,49 @@ def test_google_auth_missing_code_redirects_to_login() -> None:
     redis = FakeRedis()
 
     with student_client(session, redis) as client:
-        response = client.get(GOOGLE_PATH, follow_redirects=False)
+        response = client.get(
+            GOOGLE_PATH,
+            params={"state": "login"},
+            follow_redirects=False,
+        )
 
     assert response.status_code == 302
-    assert response.headers["location"] == (
-        f"http://localhost:3000{GOOGLE_AUTH_FAILED_PATH}"
-    )
+    assert response.headers["location"] == google_failure_url()
+    assert session.added == []
+    assert session.commits == 0
+    assert redis.values == {}
+
+
+def test_google_auth_missing_state_returns_422() -> None:
+    session = FakeStudentSession()
+    redis = FakeRedis()
+
+    with student_client(session, redis) as client:
+        response = client.get(
+            GOOGLE_PATH,
+            params={"code": "auth-code"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 422
+    assert session.added == []
+    assert session.commits == 0
+    assert redis.values == {}
+
+
+def test_google_auth_failure_redirect_uses_state_path() -> None:
+    session = FakeStudentSession()
+    redis = FakeRedis()
+
+    with student_client(session, redis) as client:
+        response = client.get(
+            GOOGLE_PATH,
+            params={"state": "auth/callback"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 302
+    assert response.headers["location"] == google_failure_url("auth/callback")
     assert session.added == []
     assert session.commits == 0
     assert redis.values == {}
@@ -437,12 +480,12 @@ def test_google_auth_blank_code_redirects_to_login() -> None:
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "   "},
+            params={"code": "   ", "state": "login"},
             follow_redirects=False,
         )
 
     assert response.status_code == 302
-    assert response.headers["location"].endswith(GOOGLE_AUTH_FAILED_PATH)
+    assert response.headers["location"] == google_failure_url()
     assert redis.values == {}
 
 
@@ -459,12 +502,12 @@ def test_google_auth_token_exchange_failure_redirects_to_login(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
     assert response.status_code == 302
-    assert response.headers["location"].endswith(GOOGLE_AUTH_FAILED_PATH)
+    assert response.headers["location"] == google_failure_url()
     assert session.commits == 0
     assert session.rollbacks == 1
     assert redis.values == {}
@@ -483,12 +526,12 @@ def test_google_auth_userinfo_failure_redirects_to_login(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
     assert response.status_code == 302
-    assert response.headers["location"].endswith(GOOGLE_AUTH_FAILED_PATH)
+    assert response.headers["location"] == google_failure_url()
     assert session.commits == 0
     assert redis.values == {}
 
@@ -504,12 +547,12 @@ def test_google_auth_commit_failure_redirects_to_login(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
     assert response.status_code == 302
-    assert response.headers["location"].endswith(GOOGLE_AUTH_FAILED_PATH)
+    assert response.headers["location"] == google_failure_url()
     assert session.rollbacks == 1
     assert redis.values == {}
 
@@ -525,11 +568,11 @@ def test_google_auth_redis_failure_redirects_to_login(
     with student_client(session, redis) as client:
         response = client.get(
             GOOGLE_PATH,
-            params={"code": "auth-code"},
+            params={"code": "auth-code", "state": "login"},
             follow_redirects=False,
         )
 
     assert response.status_code == 302
-    assert response.headers["location"].endswith(GOOGLE_AUTH_FAILED_PATH)
+    assert response.headers["location"] == google_failure_url()
     assert session.rollbacks == 1
     assert redis.values == {}

@@ -5,20 +5,20 @@ import json
 import jwt
 import pytest
 
-from app.security import unsign_cookie_value, verify_password
+from app.security import unsign_cookie_value, verify_hash
 from app.services.notification.model import (
     Notification,
     NotificationAudience,
     NotificationType,
 )
 from app.services.outbox.model import Outbox, OutboxStatus
-from app.services.student.router.student import (
+from app.services.student.router import (
     AUTH_UNAVAILABLE,
     EMAIL_NOT_VERIFIED,
     INVALID_CREDENTIALS,
     VERIFICATION_TOKEN_TTL_SECONDS,
-    build_verification_link,
 )
+from app.services.student.utils import build_verification_link
 from tests.fakes import FakeRedis
 from tests.helpers import TEST_COOKIE_SECRET, TEST_JWT_SECRET
 from tests.student_fakes import (
@@ -61,9 +61,9 @@ def test_login_success_creates_session_and_refresh_cookie() -> None:
 
         assert redis.values[session_key] == json.dumps(
             {
-                "userId": str(student.user_id),
-                "role": "student",
+                "id": str(student.user_id),
                 "email": DEFAULT_EMAIL,
+                "role": "student",
             }
         )
         assert redis.ttls[session_key] == 604800
@@ -130,7 +130,7 @@ def test_login_wrong_password_returns_generic_401() -> None:
 
     assert response.status_code == 401
     assert response.json() == {"detail": INVALID_CREDENTIALS}
-    assert verify_password(DEFAULT_PASSWORD, student.password_hash)
+    assert verify_hash(DEFAULT_PASSWORD, student.password_hash)
     assert session.added == []
     assert redis.values == {}
 

@@ -4,21 +4,21 @@ from uuid import uuid4
 
 import pytest
 
-from app.security import verify_password
+from app.security import verify_hash
 from app.services.notification.model import (
     Notification,
     NotificationAudience,
     NotificationType,
 )
 from app.services.outbox.model import Outbox, OutboxStatus
-from app.services.student.router.student import (
+from app.services.student.router import (
     INVALID_PASSWORD_RESET_TOKEN,
     PASSWORD_RESET_SENT,
     PASSWORD_RESET_TOKEN_TTL_SECONDS,
     PASSWORD_RESET_UNAVAILABLE,
     STUDENT_NOT_FOUND,
-    build_password_reset_link,
 )
+from app.services.student.utils import build_password_reset_link
 from tests.fakes import FakeRedis
 from tests.student_fakes import (
     DEFAULT_EMAIL,
@@ -32,6 +32,10 @@ EMAIL_PATH = "/student/api/v1/email"
 RESET_PATH = "/student/api/v1/password-reset"
 TOKEN = "password-reset-token"
 NEW_PASSWORD = "NewStrong2!"
+
+
+def test_password_reset_token_ttl_is_five_minutes() -> None:
+    assert PASSWORD_RESET_TOKEN_TTL_SECONDS == 300
 
 
 def test_email_endpoint_queues_password_reset_notification() -> None:
@@ -168,8 +172,8 @@ def test_password_reset_updates_password_and_verifies_email() -> None:
     assert response.status_code == 200
     assert response.json() == {"message": "Password reset successfully"}
     assert student.password_hash is not None
-    assert verify_password(NEW_PASSWORD, student.password_hash)
-    assert not verify_password(DEFAULT_PASSWORD, student.password_hash)
+    assert verify_hash(NEW_PASSWORD, student.password_hash)
+    assert not verify_hash(DEFAULT_PASSWORD, student.password_hash)
     assert student.is_email_verified is True
     assert session.commits == 1
     assert TOKEN not in redis.values

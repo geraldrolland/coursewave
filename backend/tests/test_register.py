@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.base_dependencies import get_session
 from app.main import create_app
-from app.security import verify_password
+from app.security import verify_hash
 from app.services.notification.model import (
     Notification,
     NotificationAudience,
@@ -19,10 +19,8 @@ from app.services.notification.model import (
 )
 from app.services.outbox.model import Outbox, OutboxStatus
 from app.services.student.model import AuthMethod, Student
-from app.services.student.router.student import (
-    VERIFICATION_TOKEN_TTL_SECONDS,
-    build_verification_link,
-)
+from app.services.student.router import VERIFICATION_TOKEN_TTL_SECONDS
+from app.services.student.utils import build_verification_link
 from tests.fakes import FakeRedis
 from tests.helpers import build_settings
 
@@ -147,7 +145,7 @@ def test_registration_creates_student_notification_and_outbox() -> None:
     assert student.auth_method is AuthMethod.EMAIL
     assert student.password_hash is not None
     assert student.password_hash != VALID_PAYLOAD["password"]
-    assert verify_password(VALID_PAYLOAD["password"], student.password_hash)
+    assert verify_hash(VALID_PAYLOAD["password"], student.password_hash)
 
     assert session.flushed is True
     assert session.committed is True
@@ -273,7 +271,7 @@ def test_registration_uses_https_app_host_when_provided() -> None:
     )
 
 
-def test_student_model_defaults_password_hash_and_auth_method() -> None:
+def test_student_model_defaults_and_constraints() -> None:
     student = Student(
         first_name="Grace",
         last_name="Hopper",
@@ -282,5 +280,11 @@ def test_student_model_defaults_password_hash_and_auth_method() -> None:
 
     assert student.password_hash is None
     assert student.auth_method is AuthMethod.EMAIL
+    assert student.role == "student"
+    assert student.is_suspended is False
+    assert student.is_verified is False
+    assert Student.__table__.c.role.nullable is False
     assert Student.__table__.c.password_hash.nullable is True
     assert Student.__table__.c.auth_method.nullable is False
+    assert Student.__table__.c.is_suspended.nullable is False
+    assert Student.__table__.c.is_verified.nullable is False
