@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.base_dependencies import get_session
 from app.main import create_app
 from app.security import hash
-from app.services.instructor.model import Instructor, InstructorProfile
+from app.services.instructor.model import Instructor
 from tests.helpers import build_settings
 
 DEFAULT_EMAIL = "ada@example.com"
@@ -29,13 +29,8 @@ class FakeScalarResult:
 class FakeInstructorSession:
     """Minimal async session double for instructor account routes."""
 
-    def __init__(
-        self,
-        instructor: Instructor | None = None,
-        profile: InstructorProfile | None = None,
-    ) -> None:
+    def __init__(self, instructor: Instructor | None = None) -> None:
         self.instructor = instructor
-        self.profile = profile
         self.added: list[Any] = []
         self.executed: list[Any] = []
         self.get_calls: list[tuple[Any, Any]] = []
@@ -45,9 +40,6 @@ class FakeInstructorSession:
 
     async def execute(self, statement: Any) -> FakeScalarResult:
         self.executed.append(statement)
-        entity = statement.column_descriptions[0].get("entity")
-        if entity is InstructorProfile:
-            return FakeScalarResult(self.profile)
         return FakeScalarResult(self.instructor)
 
     async def get(
@@ -78,7 +70,7 @@ class FakeInstructorSession:
 
 
 class FakeMinio:
-    """In-memory MinIO client double for instructor profile tests."""
+    """In-memory MinIO client double for instructor profile-picture tests."""
 
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], dict[str, Any]] = {}

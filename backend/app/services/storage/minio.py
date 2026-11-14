@@ -33,6 +33,13 @@ def build_profile_picture_url(settings: Settings, object_key: str) -> str:
     return f"{base_url}/{settings.minio_bucket}/{object_key}"
 
 
+def build_cover_image_url(settings: Settings, object_key: str) -> str:
+    """Build the public URL for a stored instructor cover image."""
+
+    base_url = settings.minio_public_url.rstrip("/")
+    return f"{base_url}/{settings.minio_cover_bucket}/{object_key}"
+
+
 def object_key_from_profile_picture_url(
     url: str,
     bucket: str,

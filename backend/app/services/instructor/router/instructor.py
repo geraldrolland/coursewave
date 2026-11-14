@@ -2,18 +2,22 @@
 
 import logging
 import secrets
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import (
     APIRouter,
     Depends,
+    Form,
     HTTPException,
     Query,
     Request,
     Response,
     status,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse
+from minio import Minio
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
@@ -34,12 +38,18 @@ from app.services.instructor.google import (
 )
 from app.services.instructor.model import AuthMethod, Instructor
 from app.services.instructor.schema import (
+    InstructorCoverImageForm,
+    InstructorCoverImageResponse,
     InstructorEmailRequest,
     InstructorLoginRequest,
     InstructorLoginResponse,
     InstructorMeResponse,
     InstructorMessageResponse,
     InstructorPasswordResetRequest,
+    InstructorProfileCreateRequest,
+    InstructorProfilePicForm,
+    InstructorProfilePicResponse,
+    InstructorProfileUpdateRequest,
     InstructorRegisterRequest,
     InstructorRegisterResponse,
     InstructorResendOtpRequest,
@@ -63,21 +73,32 @@ from app.services.instructor.utils import (
     PASSWORD_RESET_SENT,
     PASSWORD_RESET_UNAVAILABLE,
     VERIFICATION_TOKEN_TTL_SECONDS,
+    _authenticated_instructor_id,
     _build_app_url,
     _build_email_notification,
     _create_login_tokens,
     _delete_token,
+    _delete_uploaded_picture,
     _generate_otp_code,
     _get_instructor_by_email,
     _get_otp_challenge,
     _get_token_instructor_id,
     _google_failure_redirect,
     _is_otp_expired,
+    _read_profile_picture,
     _store_otp_challenge,
     _store_otp_notification,
     _store_password_reset_notification,
     _store_verification_notification,
     build_verification_link,
+)
+from app.services.storage.minio import (
+    build_cover_image_url,
+    build_profile_picture_object_key,
+    build_profile_picture_url,
+    delete_profile_picture,
+    object_key_from_profile_picture_url,
+    upload_profile_picture,
 )
 
 router = APIRouter(prefix="/instructor/api/v1", tags=["instructors"])
@@ -89,6 +110,14 @@ INVALID_CREDENTIALS = "Invalid email or password"
 EMAIL_NOT_VERIFIED = (
     "Email is not verified. A verification email has been sent."
 )
+PROFILE_PICTURE_UNAVAILABLE = "Profile picture service unavailable"
+PROFILE_PICTURE_DELETED = "Profile picture deleted successfully"
+PROFILE_PICTURE_NOT_SET = "Profile picture is not set"
+COVER_IMAGE_UNAVAILABLE = "Cover image service unavailable"
+COVER_IMAGE_DELETED = "Cover image deleted successfully"
+COVER_IMAGE_NOT_SET = "Cover image is not set"
+PROFILE_ALREADY_EXISTS = "Instructor profile already exists"
+PROFILE_NOT_FOUND = "Instructor profile not found"
 
 
 @router.post(
@@ -565,6 +594,435 @@ async def logout(
         build_clear_refresh_cookie(),
     )
     return InstructorMessageResponse(message="Logged out successfully")
+
+
+@router.post(
+    "/profile",
+    response_model=InstructorProfileCreateRequest,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_200_OK,
+)
+async def create_instructor_profile(
+    payload: InstructorProfileCreateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorProfileCreateRequest:
+    """Create the authenticated instructor's JSON profile."""
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    if instructor.profile is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=PROFILE_ALREADY_EXISTS,
+        )
+
+    instructor.profile = payload.model_dump(
+        mode="json",
+        exclude_none=True,
+    )
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    return payload
+
+
+@router.get(
+    "/profile",
+    response_model=InstructorProfileCreateRequest,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_200_OK,
+)
+async def get_instructor_profile(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorProfileCreateRequest:
+    """Return the authenticated instructor's JSON profile."""
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    if instructor.profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=PROFILE_NOT_FOUND,
+        )
+
+    return InstructorProfileCreateRequest.model_validate(
+        instructor.profile
+    )
+
+
+@router.patch(
+    "/profile",
+    response_model=InstructorProfileCreateRequest,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_200_OK,
+)
+async def update_instructor_profile(
+    payload: InstructorProfileUpdateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorProfileCreateRequest:
+    """Update the authenticated instructor's JSON profile."""
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    if instructor.profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=PROFILE_NOT_FOUND,
+        )
+
+    updates = payload.model_dump(
+        mode="json",
+        exclude_none=True,
+        exclude_unset=True,
+    )
+    merged_profile = {**instructor.profile, **updates}
+    updated_profile = InstructorProfileCreateRequest.model_validate(
+        merged_profile
+    )
+
+    instructor.profile = updated_profile.model_dump(
+        mode="json",
+        exclude_none=True,
+    )
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    return updated_profile
+
+
+@router.post(
+    "/profile-pic",
+    response_model=InstructorProfilePicResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def upload_instructor_profile_pic(
+    request: Request,
+    profile_form: Annotated[InstructorProfilePicForm, Form()],
+    session: AsyncSession = Depends(get_session),
+) -> InstructorProfilePicResponse:
+    """Upload or replace the authenticated instructor's profile picture."""
+
+    settings: Settings = request.app.state.settings
+    minio_client: Minio = request.app.state.minio
+
+    upload_data, picture_metadata = await _read_profile_picture(
+        profile_form.picture
+    )
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    generated_object_key = False
+    if instructor.profile_pic_url is None:
+        object_key = build_profile_picture_object_key(
+            picture_metadata.extension
+        )
+        instructor.profile_pic_url = build_profile_picture_url(
+            settings,
+            object_key,
+        )
+        generated_object_key = True
+    else:
+        object_key = object_key_from_profile_picture_url(
+            instructor.profile_pic_url,
+            settings.minio_bucket,
+        )
+        if object_key is None:
+            logger.warning(
+                "Could not parse the existing profile picture URL: %s",
+                instructor.profile_pic_url,
+            )
+            object_key = build_profile_picture_object_key(
+                picture_metadata.extension
+            )
+            instructor.profile_pic_url = build_profile_picture_url(
+                settings,
+                object_key,
+            )
+            generated_object_key = True
+
+    try:
+        await run_in_threadpool(
+            upload_profile_picture,
+            minio_client,
+            settings.minio_bucket,
+            object_key,
+            upload_data,
+            picture_metadata.upload_content_type,
+        )
+    except Exception as exc:
+        await session.rollback()
+        if generated_object_key:
+            await _delete_uploaded_picture(
+                minio_client,
+                settings.minio_bucket,
+                object_key,
+            )
+        logger.exception("Failed to upload an instructor profile picture")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=PROFILE_PICTURE_UNAVAILABLE,
+        ) from exc
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        if generated_object_key:
+            await _delete_uploaded_picture(
+                minio_client,
+                settings.minio_bucket,
+                object_key,
+            )
+        raise
+
+    return InstructorProfilePicResponse(
+        profile_pic_url=instructor.profile_pic_url,
+    )
+
+
+@router.delete(
+    "/profile-pic",
+    response_model=InstructorMessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def delete_instructor_profile_pic(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorMessageResponse:
+    """Delete the authenticated instructor's profile picture."""
+
+    settings: Settings = request.app.state.settings
+    minio_client: Minio = request.app.state.minio
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    if instructor.profile_pic_url is None:
+        return InstructorMessageResponse(message=PROFILE_PICTURE_NOT_SET)
+
+    object_key = object_key_from_profile_picture_url(
+        instructor.profile_pic_url,
+        settings.minio_bucket,
+    )
+    if object_key is not None:
+        try:
+            await run_in_threadpool(
+                delete_profile_picture,
+                minio_client,
+                settings.minio_bucket,
+                object_key,
+            )
+        except Exception as exc:
+            logger.exception("Failed to delete an instructor profile picture")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=PROFILE_PICTURE_UNAVAILABLE,
+            ) from exc
+    else:
+        logger.warning(
+            "Could not parse the existing profile picture URL: %s",
+            instructor.profile_pic_url,
+        )
+
+    instructor.profile_pic_url = None
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    return InstructorMessageResponse(message=PROFILE_PICTURE_DELETED)
+
+
+@router.post(
+    "/cover-image",
+    response_model=InstructorCoverImageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def upload_instructor_cover_image(
+    request: Request,
+    cover_form: Annotated[InstructorCoverImageForm, Form()],
+    session: AsyncSession = Depends(get_session),
+) -> InstructorCoverImageResponse:
+    """Upload or replace the authenticated instructor's cover image."""
+
+    settings: Settings = request.app.state.settings
+    minio_client: Minio = request.app.state.minio
+
+    upload_data, picture_metadata = await _read_profile_picture(
+        cover_form.picture
+    )
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    generated_object_key = False
+    if instructor.cover_image_url is None:
+        object_key = build_profile_picture_object_key(
+            picture_metadata.extension
+        )
+        instructor.cover_image_url = build_cover_image_url(
+            settings,
+            object_key,
+        )
+        generated_object_key = True
+    else:
+        object_key = object_key_from_profile_picture_url(
+            instructor.cover_image_url,
+            settings.minio_cover_bucket,
+        )
+        if object_key is None:
+            logger.warning(
+                "Could not parse the existing cover image URL: %s",
+                instructor.cover_image_url,
+            )
+            object_key = build_profile_picture_object_key(
+                picture_metadata.extension
+            )
+            instructor.cover_image_url = build_cover_image_url(
+                settings,
+                object_key,
+            )
+            generated_object_key = True
+
+    try:
+        await run_in_threadpool(
+            upload_profile_picture,
+            minio_client,
+            settings.minio_cover_bucket,
+            object_key,
+            upload_data,
+            picture_metadata.upload_content_type,
+        )
+    except Exception as exc:
+        await session.rollback()
+        if generated_object_key:
+            await _delete_uploaded_picture(
+                minio_client,
+                settings.minio_cover_bucket,
+                object_key,
+            )
+        logger.exception("Failed to upload an instructor cover image")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=COVER_IMAGE_UNAVAILABLE,
+        ) from exc
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        if generated_object_key:
+            await _delete_uploaded_picture(
+                minio_client,
+                settings.minio_cover_bucket,
+                object_key,
+            )
+        raise
+
+    return InstructorCoverImageResponse(
+        cover_image_url=instructor.cover_image_url,
+    )
+
+
+@router.delete(
+    "/cover-image",
+    response_model=InstructorMessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def delete_instructor_cover_image(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorMessageResponse:
+    """Delete the authenticated instructor's cover image."""
+
+    settings: Settings = request.app.state.settings
+    minio_client: Minio = request.app.state.minio
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    if instructor.cover_image_url is None:
+        return InstructorMessageResponse(message=COVER_IMAGE_NOT_SET)
+
+    object_key = object_key_from_profile_picture_url(
+        instructor.cover_image_url,
+        settings.minio_cover_bucket,
+    )
+    if object_key is not None:
+        try:
+            await run_in_threadpool(
+                delete_profile_picture,
+                minio_client,
+                settings.minio_cover_bucket,
+                object_key,
+            )
+        except Exception as exc:
+            logger.exception("Failed to delete an instructor cover image")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=COVER_IMAGE_UNAVAILABLE,
+            ) from exc
+    else:
+        logger.warning(
+            "Could not parse the existing cover image URL: %s",
+            instructor.cover_image_url,
+        )
+
+    instructor.cover_image_url = None
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    return InstructorMessageResponse(message=COVER_IMAGE_DELETED)
 
 
 @router.patch(

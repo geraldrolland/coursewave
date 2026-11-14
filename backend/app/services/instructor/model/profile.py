@@ -36,7 +36,6 @@ class InstructorProfile(SQLModel, table=True):
     )
     first_name: str = Field(max_length=100)
     middle_name: str | None = Field(default=None, max_length=100)
-    email: str = Field(max_length=320, unique=True, index=True)
     last_name: str = Field(max_length=100)
     gender: Gender = Field(
         sa_column=Column(
@@ -53,7 +52,6 @@ class InstructorProfile(SQLModel, table=True):
     city: str = Field(max_length=100)
     bio: str = Field(max_length=1000)
     headline: str = Field(max_length=255)
-    profile_pic_url: str = Field(max_length=2048)
     expertise: list[str] = Field(
         sa_column=Column(JSON, nullable=False),
     )

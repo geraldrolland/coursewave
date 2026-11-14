@@ -43,6 +43,7 @@ x-backend-environment: &backend-environment
   MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-coursewave}"
   MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-coursewave-secret}"
   MINIO_BUCKET: "${MINIO_BUCKET:-profilepics}"
+  MINIO_COVER_BUCKET: "${MINIO_COVER_BUCKET:-coverimages}"
   MINIO_SECURE: "false"
 
   SENDGRID_API_KEY: "${SENDGRID_API_KEY:-SENDGRID_API_KEY_PLACEHOLDER}"
@@ -156,6 +157,8 @@ services:
         done
         mc mb --ignore-existing local/profilepics
         mc anonymous set download local/profilepics
+        mc mb --ignore-existing local/coverimages
+        mc anonymous set download local/coverimages
     networks:
       - coursewave
 

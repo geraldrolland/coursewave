@@ -23,13 +23,11 @@ def make_profile(instructor_id: UUID) -> InstructorProfile:
         instructor_id=instructor_id,
         first_name="Ada",
         last_name="Lovelace",
-        email="ada@example.com",
         gender=Gender.FEMALE,
         country_of_residence="United Kingdom",
         city="London",
         bio="Mathematician and writer.",
         headline="Software engineer",
-        profile_pic_url="http://localhost:9000/profilepics/ada.png",
         expertise=["tech", "science"],
         years_of_exp=10,
         current_occupation="Engineer",
@@ -49,10 +47,19 @@ def test_instructor_defaults_and_constraints() -> None:
     assert instructor.is_2fa_enabled is False
     assert instructor.auth_method is AuthMethod.EMAIL
     assert instructor.role == "instructor"
+    assert instructor.profile_pic_url is None
+    assert instructor.cover_image_url is None
+    assert instructor.profile is None
     assert table.c.role.nullable is False
     assert table.c.email.nullable is False
     assert table.c.email.unique is True
     assert table.c.password_hash.nullable is True
+    assert table.c.profile_pic_url.nullable is True
+    assert table.c.profile_pic_url.type.length == 2048
+    assert table.c.cover_image_url.nullable is True
+    assert table.c.cover_image_url.type.length == 2048
+    assert table.c.profile.nullable is True
+    assert isinstance(table.c.profile.type, JSON)
     assert table.c.auth_method.nullable is False
     assert table.c.auth_method.type.name == "instructor_auth_method"
 
@@ -76,8 +83,6 @@ def test_instructor_profile_defaults_and_constraints() -> None:
     assert table.c.profile_id.primary_key is True
     assert table.c.instructor_id.unique is True
     assert table.c.instructor_id.nullable is False
-    assert table.c.email.unique is True
-    assert table.c.email.nullable is False
     assert table.c.gender.nullable is False
     assert table.c.gender.type.name == "instructor_gender"
     assert table.c.middle_name.nullable is True
@@ -90,13 +95,11 @@ def test_instructor_profile_defaults_and_constraints() -> None:
     for column_name in (
         "first_name",
         "last_name",
-        "email",
         "gender",
         "country_of_residence",
         "city",
         "bio",
         "headline",
-        "profile_pic_url",
         "expertise",
         "years_of_exp",
         "current_occupation",

@@ -30,9 +30,6 @@ from app.services.instructor.model import (  # noqa: F401
 from app.services.instructor.router.instructor import (
     router as instructor_router,
 )
-from app.services.instructor.router.profile import (
-    router as instructor_profile_router,
-)
 from app.services.notification.model import Notification  # noqa: F401
 from app.services.notification.pub_sub.kafka import KafkaConsumer
 from app.services.notification.ws import router as notification_ws_router
@@ -109,7 +106,6 @@ def create_app(
 
     app.include_router(student_router)
     app.include_router(instructor_router)
-    app.include_router(instructor_profile_router)
     app.include_router(notification_ws_router)
 
     # add_middleware is LIFO: the last added middleware runs first.

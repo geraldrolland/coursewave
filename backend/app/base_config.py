@@ -71,6 +71,7 @@ class Settings(BaseSettings):
     minio_access_key: str = "coursewave"
     minio_secret_key: str = "coursewave-secret"
     minio_bucket: str = "profilepics"
+    minio_cover_bucket: str = "coverimages"
     minio_secure: bool = False
 
     google_client_id: str = "GOOGLE_CLIENT_ID_PLACEHOLDER"

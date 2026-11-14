@@ -74,8 +74,7 @@ backend/
 │       │   │   └── profile.py
 │       │   ├── router/
 │       │   │   ├── __init__.py
-│       │   │   ├── instructor.py
-│       │   │   └── profile.py
+│       │   │   └── instructor.py
 │       │   ├── schema/
 │       │   │   └── __init__.py
 │       │   ├── google.py
@@ -195,10 +194,11 @@ Copy-Item .env.example .env
 | `DATABASE_URL` | Optional SQLAlchemy database URL override | `postgresql+asyncpg://postgres:user123@localhost:5432/coursewave_db` |
 | `RABBITMQ_URL` | Broker URL used by the Celery worker | `amqp://guest:guest@localhost:5672/` |
 | `MINIO_ENDPOINT` | MinIO API address used by the backend | `localhost:9000` |
-| `MINIO_PUBLIC_URL` | Public base URL embedded in profile-picture URLs | `http://localhost:9000` |
+| `MINIO_PUBLIC_URL` | Public base URL embedded in image URLs | `http://localhost:9000` |
 | `MINIO_ACCESS_KEY` | MinIO access key | `coursewave` |
 | `MINIO_SECRET_KEY` | MinIO secret key | `coursewave-secret` |
 | `MINIO_BUCKET` | Bucket for uploaded profile pictures | `profilepics` |
+| `MINIO_COVER_BUCKET` | Bucket for uploaded instructor cover images | `coverimages` |
 | `MINIO_SECURE` | Use HTTPS when connecting to MinIO | `false` |
 | `SENDGRID_API_KEY` | SendGrid API key used by the email provider | `SENDGRID_API_KEY_PLACEHOLDER` |
 | `SENDGRID_FROM_EMAIL` | Verified sender address used by the email provider | `no-reply@coursewave.example` |
@@ -250,10 +250,10 @@ Compose starts nine services:
 - `redis` - sessions, cache, rate-limit counters, verification tokens, and
   notification locks
 - `rabbitmq` - broker with the management UI on `http://localhost:15672`
-- `minio` - profile-picture object storage with the API on
+- `minio` - profile-picture and cover-image object storage with the API on
   `http://localhost:9000` and console on `http://localhost:9001`
-- `minio-init` - one-shot setup that creates the `profilepics` bucket and marks
-  it publicly readable, then exits
+- `minio-init` - one-shot setup that creates the `profilepics` and `coverimages`
+  buckets and marks them publicly readable, then exits
 
 The backend waits for `minio-init` to complete successfully before starting.
 Compose uses `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` for the MinIO root
@@ -713,8 +713,9 @@ routes.
 
 - `instructor`: UUID `instructor_id`, required unique `email`, a non-null
   `role` defaulting to `instructor`, email-verification and 2FA flags defaulting
-  to `false`, nullable `password_hash`, and `auth_method` defaulting to `email`
-  with `google` as the other supported value.
+  to `false`, nullable `password_hash`, nullable `profile_pic_url`, nullable
+  `cover_image_url`, nullable JSON `profile`, and `auth_method` defaulting to
+  `email` with `google` as the other supported value.
 - `instructor_profile`: UUID `profile_id`, unique foreign key `instructor_id`,
   required names and profile fields, a `male`/`female` gender enum, required
   JSON `expertise` such as `["tech", "science"]`, an integer `years_of_exp`,
@@ -736,50 +737,143 @@ The `education`, `experience`, and `payment_info` tables include the standard
 `ended_at` are stored as `MM/YYYY` strings. Model-level validation is
 intentionally omitted; callers are expected to validate input separately.
 
-## Instructor Profile Creation
+## Instructor JSON Profile
 
-`POST /instructor/api/v1/profile` requires a Bearer access token and accepts
-`multipart/form-data`. An instructor can create only one profile; an existing
-profile returns `403 {"detail": "Instructor profile already exists"}`.
+`POST /instructor/api/v1/profile` requires a Bearer access token and accepts a
+JSON body. An instructor can create only one profile; an existing profile
+returns `403 {"detail": "Instructor profile already exists"}`.
 
-Required fields:
+Request body:
 
-| Field | Description |
-|-------|-------------|
-| `first_name` | Required, trimmed, 1–100 characters |
-| `last_name` | Required, trimmed, 1–100 characters |
-| `gender` | `male` or `female` |
-| `country_of_residence` | Required, 1–100 characters |
-| `state` | Required, 1–100 characters |
-| `city` | Required, 1–100 characters |
-| `bio` | Required, 1–1000 characters |
-| `headline` | Required, 1–255 characters |
-| `profile_pic` | Required JPEG or PNG smaller than 5 MB |
-| `current_occupation` | Required, 1–255 characters |
-| `years_of_exp` | Required non-negative integer |
-| `expertise` | Required non-empty list of strings |
-
-Optional fields:
-
-- `middle_name`: trimmed, 1–100 characters when supplied.
-- `company`: trimmed, 1–255 characters when supplied.
-- `social_links`: JSON list of objects containing `linkedin` and/or `x` URLs.
-  When supplied, the list must be non-empty and every object must contain at
-  least one link.
-
-`expertise` and `social_links` accept either JSON-encoded form values or
-repeated form fields. For example:
-
-```text
-expertise=["tech","science"]
-social_links=[{"linkedin":"https://www.linkedin.com/in/ada","x":"https://x.com/ada"}]
+```json
+{
+  "first_name": "Ada",
+  "middle_name": "Augusta",
+  "last_name": "Lovelace",
+  "gender": "female",
+  "country_of_residence": "United Kingdom",
+  "state": "England",
+  "city": "London",
+  "bio": "Mathematician and writer.",
+  "headline": "Software engineer",
+  "expertise": ["software engineering", "AI engineering"],
+  "years_of_exp": 10,
+  "current_occupation": "Engineer",
+  "company": "CourseWave",
+  "social_links": [
+    {"linkedin": "https://www.linkedin.com/in/ada"},
+    {"x": "https://x.com/ada"}
+  ]
+}
 ```
 
-The endpoint resolves the instructor from the authenticated session, rejects an
-existing profile, validates the upload, generates a UUID object key, uploads the
-picture to `MINIO_BUCKET`, and stores the public URL. Upload failures return
+Rules:
+
+- `gender` must be `"male"` or `"female"`.
+- `bio` is limited to 1000 characters.
+- `expertise` must be a non-empty list of non-empty strings.
+- `years_of_exp` must be an integer greater than zero.
+- `social_links` must be a non-empty list, and every object must contain
+  `linkedin` or `x`.
+- Extra fields are rejected.
+
+On success the validated profile is stored in `Instructor.profile` as JSON and
+returned directly with `200`.
+
+`PATCH /instructor/api/v1/profile` accepts the same fields, but every field is
+optional and defaults to `null`. Only supplied non-null fields are updated; the
+existing profile is preserved for omitted fields. The endpoint requires an
+existing profile and returns `404 {"detail": "Instructor profile not found"}`
+otherwise. The response is the full merged profile.
+
+`GET /instructor/api/v1/profile` returns the authenticated instructor's stored
+profile directly. If the instructor has no profile, it returns
+`404 {"detail": "Instructor profile not found"}`.
+
+## Instructor Profile Picture
+
+### Upload or replace
+
+`POST /instructor/api/v1/profile-pic` requires a Bearer access token and accepts
+exactly one multipart file field named `profile_pic`. Extra form fields and
+multiple files are rejected with `422`.
+
+The image must be a non-empty `.jpg` or `.jpeg` file smaller than 5 MB. The
+endpoint validates it with Pydantic, then:
+
+- If `profile_pic_url` is empty, generates a UUID object key, builds the public
+  URL, stores it on the instructor, uploads the image to `MINIO_BUCKET`, and
+  commits.
+- If `profile_pic_url` already exists, uploads the new image to the same object
+  key and commits.
+- If the existing URL cannot be parsed, generates a new UUID key and URL.
+
+Success returns:
+
+```json
+{
+  "profile_pic_url": "http://localhost:9000/profilepics/6f0d...d4.jpg"
+}
+```
+
+Upload failures return
 `503 {"detail": "Profile picture service unavailable"}`. Commit failures roll
-back and delete the newly uploaded object on a best-effort basis.
+back, and newly generated objects are deleted on a best-effort basis.
+
+### Delete
+
+`DELETE /instructor/api/v1/profile-pic` requires a Bearer access token. It
+deletes the stored object from `MINIO_BUCKET`, sets `profile_pic_url` to `null`,
+and commits. Success returns:
+
+```json
+{
+  "message": "Profile picture deleted successfully"
+}
+```
+
+If no picture is set, the endpoint returns `200` with
+`{"message": "Profile picture is not set"}`. MinIO deletion failures return
+`503 {"detail": "Profile picture service unavailable"}` without clearing the
+stored URL.
+
+## Instructor Cover Image
+
+### Upload or replace
+
+`POST /instructor/api/v1/cover-image` requires a Bearer access token and accepts
+exactly one multipart file field named `cover_image`. Extra form fields and
+multiple files are rejected with `422`.
+
+The image must be a non-empty `.jpg` or `.jpeg` file smaller than 5 MB. The
+endpoint behaves like the profile-picture upload but stores objects in
+`MINIO_COVER_BUCKET` (`coverimages` by default).
+
+Success returns:
+
+```json
+{
+  "cover_image_url": "http://localhost:9000/coverimages/6f0d...d4.jpg"
+}
+```
+
+Upload failures return `503 {"detail": "Cover image service unavailable"}`.
+
+### Delete
+
+`DELETE /instructor/api/v1/cover-image` requires a Bearer access token. It
+deletes the stored object, sets `cover_image_url` to `null`, and commits.
+Success returns:
+
+```json
+{
+  "message": "Cover image deleted successfully"
+}
+```
+
+If no cover image is set, it returns `200` with
+`{"message": "Cover image is not set"}`. MinIO failures return `503` without
+clearing the URL.
 
 ## Instructor Registration
 
@@ -1439,7 +1533,13 @@ write and let the Beat job dispatch the registered task.
 | `PATCH` | `/instructor/api/v1/verify-email` | Verify an instructor email address | Public |
 | `POST` | `/instructor/api/v1/email` | Request an instructor password-reset email | Public |
 | `PATCH` | `/instructor/api/v1/password-reset` | Reset an instructor password | Public |
-| `POST` | `/instructor/api/v1/profile` | Create the authenticated instructor's profile | Bearer token |
+| `POST` | `/instructor/api/v1/profile` | Create the authenticated instructor's JSON profile | Bearer token |
+| `GET` | `/instructor/api/v1/profile` | Return the authenticated instructor's JSON profile | Bearer token |
+| `PATCH` | `/instructor/api/v1/profile` | Partially update the instructor's JSON profile | Bearer token |
+| `POST` | `/instructor/api/v1/profile-pic` | Upload or replace the instructor profile picture | Bearer token |
+| `DELETE` | `/instructor/api/v1/profile-pic` | Delete the instructor profile picture | Bearer token |
+| `POST` | `/instructor/api/v1/cover-image` | Upload or replace the instructor cover image | Bearer token |
+| `DELETE` | `/instructor/api/v1/cover-image` | Delete the instructor cover image | Bearer token |
 | `POST` | `/student/api/v1/login` | Log in and issue tokens | Public |
 | `GET` | `/student/api/v1/google` | Log in with a Google OAuth code and state | Public |
 | `GET` | `/student/api/v1/me` | Return the current session identity | Bearer token |
@@ -1467,9 +1567,11 @@ account/profile/education/experience/payment model defaults and constraints,
 instructor registration validation, instructor login and 2FA OTP challenges,
 instructor OTP verification and resend, code hashing and expiry/TTL behavior,
 instructor Google login and 2FA redirects, instructor email verification,
-instructor password reset, instructor profile creation and picture upload,
-instructor current-session and logout routes, role defaults and the shared
-session contract,
+instructor password reset, instructor JSON profile creation/lookup/partial
+updates, instructor profile-picture and cover-image upload/replace/delete,
+instructor
+current-session and logout routes, role defaults and the shared session
+contract,
 token TTL and cleanup, duplicate-email, Redis and transaction failure handling,
 verification model defaults and constraints, student suspension/verification
 defaults, storage failure handling, email verification, password reset, CORS,
@@ -1504,10 +1606,12 @@ processed-notification caching.
   added with `NOT NULL DEFAULT false`, plus a `role` column added with
   `VARCHAR(20) NOT NULL DEFAULT 'student'`. Existing `instructor` tables need a
   `role` column added with `VARCHAR(20) NOT NULL DEFAULT 'instructor'`. Existing
-  `instructor_profile` tables need `linkedin_url` dropped, nullable JSON
-  `social_links` added, `company` made nullable, and `bio` changed to
-  `VARCHAR(1000)`. If an earlier schema exists, drop the unused `release_after`
-  column manually.
+  `instructor` tables need nullable `profile_pic_url VARCHAR(2048)`,
+  `cover_image_url VARCHAR(2048)`, and JSON `profile` columns.
+  Existing `instructor_profile` tables need `linkedin_url`, `email`, and
+  `profile_pic_url` dropped, nullable JSON `social_links` added, `company` made
+  nullable, and `bio` changed to `VARCHAR(1000)`. If an earlier schema exists,
+  drop the unused `release_after` column manually.
 
 ## License
 

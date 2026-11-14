@@ -140,82 +140,6 @@ def build_password_reset_link(app_host: str, token: str) -> str:
     return _build_app_link(app_host, "/forgot-password", token)
 
 
-def _validation_error(
-    field_name: str,
-    message: str,
-    value: object = None,
-) -> RequestValidationError:
-    """Build a request validation error for a form field."""
-
-    return RequestValidationError(
-        [
-            {
-                "type": "value_error",
-                "loc": ("body", field_name),
-                "msg": message,
-                "input": value,
-            }
-        ]
-    )
-
-
-def _decode_expertise(values: list[str]) -> list[object]:
-    """Decode expertise from a JSON array or repeated form fields."""
-
-    raw_values = [value.strip() for value in values if value.strip()]
-    if not raw_values:
-        raise _validation_error("expertise", "Expertise is required")
-
-    if len(raw_values) == 1 and raw_values[0].startswith("["):
-        try:
-            decoded = json.loads(raw_values[0])
-        except (TypeError, ValueError) as exc:
-            raise _validation_error(
-                "expertise",
-                "Expertise must be a JSON array or repeated fields",
-                raw_values[0],
-            ) from exc
-
-        if not isinstance(decoded, list):
-            raise _validation_error(
-                "expertise",
-                "Expertise must be a JSON array or repeated fields",
-                decoded,
-            )
-        return decoded
-
-    return raw_values
-
-
-def _decode_social_links(values: list[str]) -> list[object]:
-    """Decode social links from a JSON array or repeated JSON objects."""
-
-    raw_values = [value.strip() for value in values if value.strip()]
-    if not raw_values:
-        raise _validation_error(
-            "social_links",
-            "At least one social link must be provided",
-        )
-
-    decoded: list[object] = []
-    for raw_value in raw_values:
-        try:
-            item = json.loads(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise _validation_error(
-                "social_links",
-                "Social links must be JSON objects",
-                raw_value,
-            ) from exc
-
-        if isinstance(item, list):
-            decoded.extend(item)
-        else:
-            decoded.append(item)
-
-    return decoded
-
-
 async def _read_profile_picture(
     upload: UploadFile,
 ) -> tuple[bytes, InstructorProfilePictureMetadata]:
@@ -640,8 +564,6 @@ __all__ = [
     "_build_email_notification",
     "_build_otp_challenge",
     "_create_login_tokens",
-    "_decode_expertise",
-    "_decode_social_links",
     "_delete_token",
     "_delete_uploaded_picture",
     "_generate_otp_code",
@@ -657,7 +579,6 @@ __all__ = [
     "_store_otp_notification",
     "_store_password_reset_notification",
     "_store_verification_notification",
-    "_validation_error",
     "build_otp_verification_link",
     "build_password_reset_link",
     "build_verification_link",

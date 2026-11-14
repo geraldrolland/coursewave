@@ -27,8 +27,6 @@ requested refinements:
 - A complete instructor authentication suite: OTP verification and resend,
   Google login, email verification, password-reset email/reset, current session,
   and logout.
-- Protected instructor profile creation with Pydantic multipart validation,
-  social links, and MinIO-backed profile-picture upload.
 - Non-null Student.role="student" and Instructor.role="instructor" fields.
 - A shared Redis session contract of exactly {"id", "email", "role"} for both
   student and instructor logins.
@@ -344,6 +342,9 @@ Instructor Models
     is_email_verified: bool, default false
     is_2fa_enabled: bool, default false
     password_hash: nullable str, default null, max 255 characters
+    profile_pic_url: nullable str, default null, max 2048 characters
+    cover_image_url: nullable str, default null, max 2048 characters
+    profile: nullable JSON object, default null
     auth_method: AuthMethod EMAIL = "email", GOOGLE = "google"; defaults to
                  EMAIL and is non-null
     created_at / updated_at: timezone-aware datetimes
@@ -353,7 +354,6 @@ Instructor Models
                    instructor.instructor_id
     first_name: required, max 100 characters
     middle_name: nullable, default null, max 100 characters
-    email: required, unique, indexed, max 320 characters
     last_name: required, max 100 characters
     gender: Gender MALE = "male", FEMALE = "female"; required
     country_of_residence: required, max 100 characters
@@ -361,7 +361,6 @@ Instructor Models
     city: required, max 100 characters
     bio: required, max 1000 characters
     headline: required, max 255 characters
-    profile_pic_url: required, max 2048 characters
     expertise: required JSON list[str], e.g. ["tech", "science"]
     years_of_exp: required int
     current_occupation: required, max 255 characters
@@ -486,26 +485,57 @@ Instructor OTP Resend
   503 "Authentication service unavailable". Commit failures roll back and delete
   the expired token on a best-effort basis.
 
-Instructor Profile Creation
-- POST /instructor/api/v1/profile requires a Bearer access token and accepts
-  multipart/form-data.
-- Required fields: first_name, last_name, gender, country_of_residence, state,
-  city, bio (max 1000), headline, profile_pic, current_occupation,
-  years_of_exp, and expertise.
-- Optional fields: middle_name, company, and social_links.
-- profile_pic must have a .jpg, .jpeg, or .png extension (case-insensitive) and
-  be non-empty and smaller than 5 MB.
-- expertise and social_links accept JSON-encoded values or repeated form fields.
-  social_links, when supplied, must be a non-empty list and every object must
-  contain at least one of linkedin or x.
-- The instructor ID comes from the authenticated session. The endpoint loads the
-  Instructor, returns 403 "Instructor profile already exists" when a profile
-  already exists, and 404 "Instructor not found" when the instructor is missing.
-- It creates a UUID object key, uploads the picture to the configured profilepics
-  bucket, builds the public URL, inserts the profile with the instructor email,
-  and commits. Upload failures return 503 "Profile picture service unavailable".
-  Commit failures roll back and delete the newly uploaded object on a best-effort
-  basis.
+Instructor JSON Profile
+- POST /instructor/api/v1/profile is protected and accepts a JSON payload.
+- Pydantic validation requires first_name, last_name, gender, country_of_residence,
+  state, city, bio (max 1000), headline, expertise (non-empty list), years_of_exp
+  (integer > 0), current_occupation, and social_links (non-empty list).
+- middle_name and company are optional. gender is Literal["male", "female"].
+- Every social_links object must contain at least one of linkedin or x, with
+  HttpUrl validation.
+- Extra fields are rejected. The endpoint loads the authenticated instructor and
+  returns 404 when missing.
+- If instructor.profile is already set, it returns 403 "Instructor profile
+  already exists". Otherwise it stores the payload as JSON (excluding None
+  values), commits, and returns the validated profile directly.
+- PATCH /instructor/api/v1/profile accepts the same fields all optional with
+  None defaults. Missing profiles return 404 "Instructor profile not found".
+  Omitted or explicit-null fields are ignored; supplied non-null fields merge
+  into the stored JSON profile. The full merged profile is validated with
+  InstructorProfileCreateRequest and returned.
+- GET /instructor/api/v1/profile returns the stored JSON profile. Missing
+  profiles return 404 "Instructor profile not found"; missing instructors return
+  404 "Instructor not found". The response is validated with
+  InstructorProfileCreateRequest and excludes None values.
+
+Instructor Profile Picture
+- POST /instructor/api/v1/profile-pic is protected and multipart. It accepts
+  exactly one profile_pic file and forbids extra form fields.
+- profile_pic must be a non-empty .jpg or .jpeg under 5 MB, validated with
+  Pydantic. Multiple files and invalid extensions return 422.
+- If profile_pic_url is empty, the endpoint generates a UUID object key and
+  public URL, stores the URL on the instructor, uploads to the profilepics
+  bucket, and commits.
+- If profile_pic_url exists, the endpoint uploads to the same object key and
+  commits. An unparseable existing URL falls back to a new UUID key and URL.
+- Upload failures return 503 "Profile picture service unavailable". Newly
+  generated objects are deleted after commit failures.
+- DELETE /instructor/api/v1/profile-pic is protected. It deletes the stored
+  object, clears profile_pic_url, and commits, returning 200 "Profile picture
+  deleted successfully".
+- Deleting when no picture is set returns 200 "Profile picture is not set".
+  MinIO deletion failures return 503 without clearing the URL. Unparseable URLs
+  are cleared without a bucket delete.
+
+Instructor Cover Image
+- POST /instructor/api/v1/cover-image is protected and mirrors the profile-pic
+  upload contract: exactly one cover_image .jpg/.jpeg under 5 MB, no extra form
+  fields, UUID key/URL creation, existing-key overwrite, unparseable-URL fallback,
+  upload to minio_cover_bucket (coverimages), and commit cleanup.
+- DELETE /instructor/api/v1/cover-image deletes the stored cover object, clears
+  cover_image_url, and commits. Missing images are idempotent with message
+  "Cover image is not set"; MinIO failures return 503 without clearing the URL.
+- Missing instructors return 404; invalid sessions return 401.
 
 Instructor Google Authentication
 - GET /instructor/api/v1/google?code=...&state=... is public. Google token
@@ -584,13 +614,14 @@ Verification Model
 Profile Pictures and MinIO
 - docker-compose.yml adds minio (API 9000, console 9001) and a one-shot
   minio-init service. minio-init waits for the server, creates the profilepics
-  bucket with --ignore-existing, sets anonymous download access, and exits.
+  and coverimages buckets with --ignore-existing, sets anonymous download access
+  on both, and exits.
 - The backend depends on minio-init with service_completed_successfully. MinIO
   root credentials come from MINIO_ROOT_USER and MINIO_ROOT_PASSWORD, defaulting
   to coursewave and coursewave-secret.
 - Settings: minio_endpoint (minio:9000 in Compose, localhost:9000 by default),
   minio_public_url, minio_access_key, minio_secret_key, minio_bucket
-  (profilepics), and minio_secure (false).
+  (profilepics), minio_cover_bucket (coverimages), and minio_secure (false).
 - Profile update route: PATCH /student/api/v1/profile, protected automatically
   by AuthMiddleware, multipart/form-data fields first_name, middlename, and
   profile_pic.
@@ -767,7 +798,7 @@ Completed
   Invalid session IDs return 401 and a missing student returns 404.
 - Added instructor SQLModels: Instructor (unique required email,
   verification/2FA defaults, nullable password_hash, AuthMethod),
-  InstructorProfile (separate profile_id, unique instructor_id FK, unique email,
+  InstructorProfile (separate profile_id, unique instructor_id FK,
   Gender, required profile fields, JSON expertise), Education (unique
   instructor_id FK, degree enum, MM/YYYY graduate_at), Experience (indexed
   instructor_id FK, MM/YYYY started_at/ended_at, till_present), and PaymentInfo
@@ -813,8 +844,7 @@ Completed
 - Updated session consumers to read id: the student auth helper, student /me,
   rate-limit identifier, WebSocket authentication, and WebSocket registration.
 - Added instructor schemas for OTP verification/resend, email verification, reset
-  email, password reset, profile creation/picture metadata/social links,
-  message responses, and /me.
+  email, password reset, message responses, and /me.
 - Added instructor utilities for password-reset links, action-token lookup,
   hashed OTP challenge parsing/storage, expiry checks, password-reset
   notifications, Google failure redirects, and the new error/message constants.
@@ -835,19 +865,31 @@ Completed
 - Added PATCH /instructor/api/v1/verify-email, POST /instructor/api/v1/email, and
   PATCH /instructor/api/v1/password-reset with 120-second verification tokens,
   300-second reset tokens, forgot_password notifications, and token cleanup.
-- Added POST /instructor/api/v1/profile in router/profile.py with multipart
-  Pydantic validation, JSON/repeated expertise and social_links parsing,
-  authenticated instructor lookup, one-profile enforcement, UUID profile-picture
-  upload, URL generation, and rollback/object-cleanup handling.
+- Added POST /instructor/api/v1/profile-pic with strict multipart validation,
+  UUID key/URL generation, overwrite support, MinIO upload, and commit cleanup.
+- Added DELETE /instructor/api/v1/profile-pic with bucket deletion, URL clearing,
+  idempotent empty-state handling, and MinIO failure handling.
+- Added POST/DELETE /instructor/api/v1/cover-image with the same validation and
+  lifecycle as profile-pic, using the coverimages bucket and cover_image_url.
+- Added POST /instructor/api/v1/profile with Pydantic JSON validation,
+  Literal gender values, HttpUrl social links, Instructor.profile storage, and
+  403 handling for existing profiles.
+- Added PATCH /instructor/api/v1/profile with all-optional Pydantic fields,
+  non-null-only merging, 404 handling for missing profiles, full merged-profile
+  validation, and commit rollback.
+- Added GET /instructor/api/v1/profile with stored-profile lookup, 404 handling
+  for missing profiles/instructors, validated responses, and no writes.
+- Added minio_cover_bucket (coverimages), MINIO_COVER_BUCKET environment
+  examples, Compose environment, and coverimages bucket creation in minio-init.
 - Updated InstructorProfile: bio max 1000, nullable company, nullable JSON
-  social_links, and removed linkedin_url.
+  social_links, and removed linkedin_url and email.
 - Added the new public instructor paths to base_config.py, backend/.env.example,
   and docker-compose.yml; /me and /logout remain protected.
 - Added tests/instructor_fakes.py and test_instructor_verify_otp.py,
   test_instructor_resend_otp.py, test_instructor_google.py,
   test_instructor_verify_email.py, test_instructor_password_reset.py,
-  test_instructor_me.py, test_instructor_logout.py, and
-  test_instructor_profile.py.
+  test_instructor_me.py, test_instructor_logout.py, test_instructor_profile.py,
+  test_instructor_profile_pic.py, and test_instructor_cover_image.py.
 - Updated instructor login/Google/OTP tests for Argon2 code hashes, exp values,
   24-hour TTLs, POST verification, expired-token handling, and resend behavior.
 - Updated existing tests for role defaults and the exact {id, email, role}
@@ -896,15 +938,18 @@ Known Gaps
   is_suspended and is_verified boolean columns added with NOT NULL DEFAULT false,
   plus role VARCHAR(20) NOT NULL DEFAULT 'student'. Existing instructor tables
   need role VARCHAR(20) NOT NULL DEFAULT 'instructor'. Existing
-  instructor_profile tables need linkedin_url dropped, nullable JSON social_links
-  added, company made nullable, and bio changed to VARCHAR(1000). If the earlier
-  schema exists, drop the unused release_after column manually.
+  instructor tables need nullable profile_pic_url VARCHAR(2048), cover_image_url
+  VARCHAR(2048), and JSON profile columns.
+  Existing instructor_profile tables need linkedin_url, email, and
+  profile_pic_url dropped, nullable JSON social_links added, company made
+  nullable, and bio changed to VARCHAR(1000). If the earlier schema exists, drop
+  the unused release_after column manually.
 
 
 Validation Results
 ------------------
-- pytest -q: 502 passed, no warnings.
-- Instructor-focused suite (pytest -k instructor): 140 passed.
+- pytest -q: 567 passed, no warnings.
+- Instructor-focused suite (pytest -k instructor): 205 passed.
 - compileall: passed.
 - pip check: no broken requirements.
 - git diff --check: passed; Git reported only LF-to-CRLF checkout warnings.
@@ -938,10 +983,18 @@ Validation Results
   missing/malformed/replay behavior, Google login/creation/2FA/failure
   redirects, email verification, password-reset email/reset, /me and logout,
   Redis/commit failures, and the exact {id, email, role} session shape.
-- Instructor profile tests cover successful upload/response data, JSON and
-  repeated form arrays, optional fields, existing-profile 403, auth and
-  instructor errors, field/picture validation, upload failure, and
-  commit-failure object cleanup.
+- Instructor profile-picture tests cover first upload, existing-key overwrite,
+  unparseable URL replacement, strict multipart validation, extension/size
+  rejection, auth/instructor errors, MinIO and commit failures, delete and
+  idempotent behavior, and object cleanup.
+- Instructor cover-image tests cover the same upload/overwrite/fallback flow
+  against the coverimages bucket, strict multipart validation, auth and
+  instructor errors, MinIO/commit failures, delete/idempotent behavior, and
+  cleanup.
+- Instructor JSON profile tests cover direct response/storage, GET lookup,
+  missing-profile 404s, partial merge updates, optional fields, social-link
+  rules, lowercase Literal gender, expertise/year bounds, existing/missing-
+  profile handling, invalid payloads, auth/instructor errors, and rollback.
 - docker compose config could not be run because the Docker CLI is not
   installed. The Compose YAML was parsed with PyYAML and contains:
   coursewave, worker, dlq-consumer, postgres, redis, rabbitmq.
@@ -987,36 +1040,33 @@ Relevant Files
   started_at/ended_at, till_present, and role.
 - backend/app/services/instructor/model/instructor.py
   Instructor SQLModel with AuthMethod, unique email, non-null role defaulting to
-  "instructor", verification/2FA defaults, nullable password_hash, and
-  auth_method.
+  "instructor", verification/2FA defaults, nullable password_hash, nullable
+  profile_pic_url, nullable cover_image_url, and auth_method.
 - backend/app/services/instructor/model/payment_info.py
   PaymentInfo SQLModel with unique instructor_id FK, full_name, account_number,
   bank, and version_num.
 - backend/app/services/instructor/model/profile.py
   InstructorProfile SQLModel with separate profile_id, unique instructor_id FK,
-  Gender, unique email, required profile fields, JSON expertise, nullable JSON
-  social_links, optional company, 1000-character bio, and timestamps.
+  Gender, required profile fields, JSON expertise, nullable JSON social_links,
+  optional company, 1000-character bio, and timestamps.
 - backend/app/services/instructor/router/instructor.py
   Instructor registration, login, OTP verification/resend, Google auth, current
-  session, logout, email verification, password-reset email/reset, hashed 2FA
-  challenges, Redis sessions, refresh cookies, and failure cleanup.
-- backend/app/services/instructor/router/profile.py
-  Protected multipart instructor profile creation, Pydantic form validation,
-  JSON/repeated expertise and social_links parsing, one-profile enforcement,
-  MinIO upload/URL generation, and rollback cleanup.
+  session, logout, profile-picture upload/delete, email verification,
+  password-reset email/reset, hashed 2FA challenges, Redis sessions, refresh
+  cookies, and failure cleanup.
 - backend/app/services/instructor/router/__init__.py
-  Re-exports both the instructor authentication router and the profile router.
+  Re-exports the instructor authentication router.
 - backend/app/services/instructor/schema/__init__.py
   Strict instructor registration/login/OTP/resend/email-verification/
-  password-reset/profile requests plus registration, accessToken, profile,
-  message, and /me responses.
+  password-reset/profile-picture multipart requests plus registration,
+  accessToken, profile-picture, message, and /me responses.
 - backend/app/services/instructor/google.py
   Instructor-local Google token exchange, userinfo retrieval, Pydantic response
   model, and GoogleAuthError.
 - backend/app/services/instructor/utils/__init__.py
   Instructor-local password validation, link builders, notification/outbox
   builders, login sessions, Argon2 OTP hashing, expiry checks, OTP/reset token
-  helpers, profile form decoding/upload validation, authenticated instructor ID
+  helpers, profile-picture upload validation, authenticated instructor ID
   extraction, uploaded-object cleanup, Google failure redirects, and
   error/message constants.
 - backend/app/services/student/model/student.py
@@ -1151,15 +1201,20 @@ Relevant Files
   minio-init; shared backend environment with SendGrid, Kafka
   producer/consumer, Termii, and MinIO settings.
 - backend/app/services/storage/minio.py
-  MinIO client factory, profile-picture object-key and URL helpers, upload, and
-  delete operations.
+  MinIO client factory, profile-picture and cover-image object-key/URL helpers,
+  upload, and delete operations.
 - backend/tests/test_profile.py
   Profile lookup, name updates, multipart upload validation, UUID object keys,
   existing-key overwrite behavior, and MinIO/database failure handling.
 - backend/tests/test_instructor_model.py
   Instructor, InstructorProfile, Education, Experience, and PaymentInfo
   defaults, nullability, unique constraints, enum names/values, JSON expertise,
-  and foreign-key targets.
+  JSON profile, and foreign-key targets.
+- backend/tests/test_instructor_profile.py
+  JSON profile creation/lookup/response storage, partial merge updates, optional
+  fields, social-link validation, Literal gender, expertise/year bounds,
+  existing/missing-profile handling, auth and instructor errors, invalid
+  payloads, and commit rollback.
 - backend/tests/test_instructor_register.py
   Instructor registration success, normalized email, password hashing,
   notification/outbox payloads, Redis token TTL, HTTPS links, duplicate email,
@@ -1169,8 +1224,8 @@ Relevant Files
   resend, 2FA redirect and hashed OTP challenge, expiry/TTL, notification/outbox
   payloads, Redis/commit failure cleanup, and invalid payloads.
 - backend/tests/instructor_fakes.py
-  Shared fake instructor/profile session, instructor factory, FakeMinio, and
-  app/client helper for instructor endpoint tests.
+  Shared fake instructor session, instructor factory, FakeMinio, and app/client
+  helper for instructor endpoint tests.
 - backend/tests/test_instructor_verify_otp.py
   OTP success/session/cookie/refresh behavior, Argon2 code checks, expired and
   legacy challenges, wrong/missing/malformed codes and challenges, unknown
@@ -1179,10 +1234,14 @@ Relevant Files
   Expired-only resend success, replacement hash/expiry/TTL, notification/outbox
   payloads, valid/missing/malformed token responses, unknown instructors,
   Redis/commit failures, cleanup, and strict payloads.
-- backend/tests/test_instructor_profile.py
-  Profile creation, JSON/repeated form arrays, optional fields, existing-profile
-  403, session/instructor errors, field and picture validation, upload failure,
-  and commit-failure object cleanup.
+- backend/tests/test_instructor_profile_pic.py
+  First upload and overwrite behavior, UUID keys/URLs, extra/multiple/missing
+  field rejection, extension/size validation, auth and instructor errors, MinIO
+  and commit failures, delete/idempotent/unparseable URL behavior, and cleanup.
+- backend/tests/test_instructor_cover_image.py
+  Cover-image upload/overwrite/fallback behavior, strict multipart validation,
+  coverimages bucket usage, auth/instructor errors, MinIO and commit failures,
+  delete/idempotent behavior, and cleanup.
 - backend/tests/test_instructor_google.py
   Existing/new/unverified instructor handling, 2FA OTP redirects, dashboard
   redirects, userinfo fields, Redis/DB failures, and required state.
@@ -1265,13 +1324,24 @@ Important Context
   email notification and outbox row, commits them together, and returns 200
   {"message": "OTP resent successfully"}. Missing instructors return 404; Redis
   failures return 503.
-- Instructor profile creation: POST /instructor/api/v1/profile is protected and
-  multipart. It validates the Pydantic profile model, accepts expertise and
-  social_links as JSON or repeated fields, requires a sub-5MB JPEG/PNG picture,
-  rejects an existing profile with 403, uploads a UUID object key to the
-  profilepics bucket, stores the public URL, and creates the profile for the
-  authenticated instructor. Upload failures return 503; commit failures roll
-  back and delete the uploaded object.
+- Instructor JSON profile: POST /instructor/api/v1/profile is protected and
+  validates the profile payload with Pydantic. It stores the JSON profile on the
+  instructor when none exists and returns the validated payload; existing
+  profiles return 403 "Instructor profile already exists". PATCH
+  /instructor/api/v1/profile accepts optional fields, ignores omitted/null
+  values, merges non-null updates into the stored JSON, requires an existing
+  profile (404 otherwise), and returns the full updated profile. GET
+  /instructor/api/v1/profile returns the stored profile or 404 when absent.
+- Instructor profile picture: POST /instructor/api/v1/profile-pic is protected
+  and multipart with exactly one .jpg/.jpeg profile_pic field and no extras.
+  It creates a UUID key/URL when none exists, otherwise overwrites the existing
+  object key, uploads to the profilepics bucket, and commits. DELETE
+  /instructor/api/v1/profile-pic deletes the object, clears profile_pic_url, and
+  commits; missing pictures are idempotent. MinIO failures return 503.
+- Instructor cover image: POST/DELETE /instructor/api/v1/cover-image mirror the
+  profile-pic endpoints using the cover_image field, cover_image_url, and the
+  coverimages bucket. The same image rules, overwrite fallback, idempotent delete,
+  and 503 failure behavior apply.
 - Instructor Google auth: GET /instructor/api/v1/google uses instructor-local
   helpers in app/services/instructor/google.py. Existing accounts are verified
   when needed; new accounts get is_email_verified=true, auth_method=google,
