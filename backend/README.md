@@ -21,16 +21,17 @@ directly.
 - A DLQ consumer that retries failed notifications through a TTL queue and
   marks them failed after the retry budget is exhausted.
 - Jinja-rendered email templates for OTP and email verification messages.
-- SendGrid email, Kafka push, and Termii SMS delivery through a provider
+- SendGrid email, Redis pub/sub push, and Termii SMS delivery through a provider
   registry.
-- Authenticated WebSocket notifications at `/notification`.
+- Authenticated Server-Sent Events push notifications at `/notification/push`.
 - A four-minute Redis cache that skips already-processed notifications.
 - PostgreSQL access through an async request-scoped SQLModel session.
 - MinIO-backed profile-picture storage with multipart profile updates and
   public-read picture URLs.
-- Instructor account, profile, education, experience, and payment-information
-  models with email verification, optional 2FA, email/Google auth, JSON
-  expertise, and degree enums, plus registration, login, OTP verification and
+- Instructor account, detail, professional-info, education, and
+  payment-information models with email verification, optional 2FA, email/Google
+  auth, JSON expertise/social links, and verification/degree/gender enums, plus
+  registration, login, OTP verification and
   resend, email verification, password reset, Google login, current-session, and
   logout routes.
 - Non-null `role` fields on student and instructor accounts and a shared Redis
@@ -68,10 +69,11 @@ backend/
 │       ├── instructor/
 │       │   ├── model/
 │       │   │   ├── education.py
-│       │   │   ├── experience.py
 │       │   │   ├── instructor.py
+│       │   │   ├── instructor_detail.py
+│       │   │   ├── onboard.py
 │       │   │   ├── payment_info.py
-│       │   │   └── profile.py
+│       │   │   └── professional_info.py
 │       │   ├── router/
 │       │   │   ├── __init__.py
 │       │   │   └── instructor.py
@@ -91,20 +93,12 @@ backend/
 │       │   │   ├── provider_registery.py
 │       │   │   ├── push_provider.py
 │       │   │   └── sms_provider.py
-│       │   ├── pub_sub/
-│       │   │   ├── __init__.py
-│       │   │   └── kafka/
-│       │   │       ├── __init__.py
-│       │   │       ├── kafka_consumer.py
-│       │   │       └── kafka_producer.py
+│       │   ├── router/
+│       │   │   └── __init__.py
 │       │   ├── task/
 │       │   │   └── process_notification.py
-│       │   ├── template_manager/
-│       │   │   └── __init__.py
-│       │   └── ws/
-│       │       ├── __init__.py
-│       │       ├── authentication.py
-│       │       └── websocket_notif_manager.py
+│       │   └── template_manager/
+│       │       └── __init__.py
 │       ├── outbox/
 │       │   ├── model/
 │       │   │   └── outbox.py
@@ -203,10 +197,7 @@ Copy-Item .env.example .env
 | `SENDGRID_API_KEY` | SendGrid API key used by the email provider | `SENDGRID_API_KEY_PLACEHOLDER` |
 | `SENDGRID_FROM_EMAIL` | Verified sender address used by the email provider | `no-reply@coursewave.example` |
 | `SENDGRID_FROM_NAME` | Sender display name used by the email provider | `CourseWave` |
-| `NOTIFICATION_TOPIC` | Kafka topic for push notifications | `notification` |
-| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address for push delivery | `localhost:9092` |
-| `KAFKA_CONSUMER_ENABLED` | Start the Kafka-to-WebSocket consumer | `false` |
-| `KAFKA_CONSUMER_GROUP_ID` | Kafka consumer group for WebSocket delivery | `coursewave-notification-websockets` |
+| `NOTIFICATION_TOPIC` | Redis pub/sub channel for push notifications | `notification` |
 | `TERMII_API_KEY` | Termii API key used by the SMS provider | `TERMII_API_KEY_PLACEHOLDER` |
 | `TERMII_SENDER_ID` | Registered Termii sender ID | `TERMII_SENDER_ID_PLACEHOLDER` |
 | `TERMII_CHANNEL` | Termii channel | `generic` |
@@ -707,41 +698,94 @@ stored URL remains usable. Uploads without a new picture leave
 
 ## Instructor Models
 
-The instructor service defines five SQLModel tables and public registration,
+The instructor service defines six SQLModel tables and public registration,
 login, OTP, Google, email-verification, password-reset, session, and logout
 routes.
 
 - `instructor`: UUID `instructor_id`, required unique `email`, a non-null
   `role` defaulting to `instructor`, email-verification and 2FA flags defaulting
   to `false`, nullable `password_hash`, nullable `profile_pic_url`, nullable
-  `cover_image_url`, nullable JSON `profile`, and `auth_method` defaulting to
-  `email` with `google` as the other supported value.
-- `instructor_profile`: UUID `profile_id`, unique foreign key `instructor_id`,
-  required names and profile fields, a `male`/`female` gender enum, required
-  JSON `expertise` such as `["tech", "science"]`, an integer `years_of_exp`,
-  optional `company`, a 1000-character `bio`, and nullable JSON `social_links`
-  containing entries such as `{"linkedin": "...", "x": "..."}`.
-- `education`: UUID `education_id`, unique foreign key `instructor_id`,
-  required `school` and `course`, a `doctorate`/`masters`/`bachelor`/
-  `associate`/`diploma` degree enum, and a required `graduate_at` in `MM/YYYY`
-  form.
-- `experience`: UUID `experience_id`, indexed foreign key `instructor_id`,
-  required `company_name`, `role`, and `started_at` in `MM/YYYY` form, a nullable
-  `ended_at` in `MM/YYYY` form, and `till_present` defaulting to `false`.
+  `cover_image_url`, and `auth_method` defaulting to `email` with `google` as
+  the other supported value.
+- `instructor_detail`: UUID `id`, indexed non-unique foreign key `instructor_id`,
+  `verification_status` defaulting to `pending_review`, `version` defaulting to
+  `1`, and timestamps. The status enum supports `pending_review`, `under_review`,
+  `rejected`, and `verified`.
+- `professional_info`: UUID `id`, indexed foreign key `instructor_id`, unique
+  foreign key `instructor_detail_id`, the individual profile fields (names,
+  gender, location, bio, headline, expertise, years of experience, occupation,
+  company, and social links), and timestamps.
+- `onboard`: UUID `id`, unique indexed foreign key `instructor_id`,
+  `is_onboarded` defaulting to `false`, `onboarding_status` defaulting to
+  `not_started`, `onboarding_step` defaulting to `0`, and nullable
+  `onboarding_started_at`/`onboarding_completed_at` timestamps. The status enum
+  supports `not_started`, `in_progress`, and `completed`.
+- `education`: UUID `id`, indexed foreign key `instructor_id`, unique foreign key
+  `instructor_detail_id`, required `institution_name`, `degree_type`, and
+  `field_of_study`, optional `major`,
+  `minor`, `start_date`, `end_date`, `grade`, and `description`, and
+  `is_currently_studying` defaulting to `false`. The `degree_type` enum supports
+  `high_school`, `diploma`, `associate`, `bachelors`, `postgraduate_diploma`,
+  `masters`, `doctorate`, `professional_certification`, and `other`.
 - `payment_info`: UUID `payment_info_id`, unique foreign key `instructor_id`,
   required `full_name`, `account_number`, and `bank`, and `version_num`
   defaulting to `1`.
 
-The `education`, `experience`, and `payment_info` tables include the standard
-`created_at` and `updated_at` timestamps. `graduate_at`, `started_at`, and
-`ended_at` are stored as `MM/YYYY` strings. Model-level validation is
-intentionally omitted; callers are expected to validate input separately.
+The `instructor_detail`, `professional_info`, `education`, and `payment_info`
+tables include the standard `created_at` and `updated_at` timestamps. The
+`onboard` table stores onboarding progress separately. Education
+dates use SQL `Date`. Model-level validation is intentionally omitted; callers
+are expected to validate input separately.
 
-## Instructor JSON Profile
+## Instructor Overview and 2FA
 
-`POST /instructor/api/v1/profile` requires a Bearer access token and accepts a
-JSON body. An instructor can create only one profile; an existing profile
-returns `403 {"detail": "Instructor profile already exists"}`.
+`GET /instructor/api/v1/` requires a Bearer access token and returns the
+instructor's identity plus the verification status from the highest-priority
+`InstructorDetail`:
+
+1. `under_review`
+2. `pending_review`
+3. `verified`
+4. `rejected`
+
+Details are ordered by `version` descending, so within a status the highest
+version is selected. Response:
+
+```json
+{
+  "instructor_id": "6f8c3e5e-3fbc-4f2e-8f19-3e0f6f8a9b21",
+  "email": "ada@example.com",
+  "is_2fa_enabled": false,
+  "profile_pic_url": null,
+  "cover_image_url": null,
+  "verification_status": "under_review"
+}
+```
+
+If the instructor has no detail records, the endpoint returns
+`404 {"detail": "Instructor detail not found"}`.
+
+`PATCH /instructor/api/v1/2fa` accepts:
+
+```json
+{
+  "status": true
+}
+```
+
+The status must be a JSON boolean. If it matches the current value, the endpoint
+returns `2FA already enabled` or `2FA already disabled` without committing.
+Otherwise it updates the instructor and returns `2FA enabled successfully` or
+`2FA disabled successfully`.
+
+## Instructor Professional Info
+
+`POST /instructor/api/v1/professional_info` requires a Bearer access token and
+accepts a JSON body. It creates a row in the `professional_info` table for the
+instructor's most recent `InstructorDetail`. An existing professional-info row
+returns `403 {"detail": "Professional info already exists"}`. If the instructor
+has no detail record, it returns
+`404 {"detail": "Instructor detail not found"}`.
 
 Request body:
 
@@ -777,18 +821,31 @@ Rules:
   `linkedin` or `x`.
 - Extra fields are rejected.
 
-On success the validated profile is stored in `Instructor.profile` as JSON and
-returned directly with `200`.
+During creation, the instructor’s `Onboard` row is selected `FOR UPDATE`.
+Its `onboarding_step` is incremented by one:
 
-`PATCH /instructor/api/v1/profile` accepts the same fields, but every field is
-optional and defaults to `null`. Only supplied non-null fields are updated; the
-existing profile is preserved for omitted fields. The endpoint requires an
-existing profile and returns `404 {"detail": "Instructor profile not found"}`
-otherwise. The response is the full merged profile.
+- If the new step equals `6`, `onboarding_status` becomes `completed` and
+  `is_onboarded` becomes `true`.
+- Otherwise, `not_started` becomes `in_progress`; `in_progress` and `completed`
+  remain unchanged.
 
-`GET /instructor/api/v1/profile` returns the authenticated instructor's stored
-profile directly. If the instructor has no profile, it returns
-`404 {"detail": "Instructor profile not found"}`.
+The onboard update and the `professional_info` insert commit atomically. If no
+onboard row exists, the endpoint returns
+`404 {"detail": "Onboard record not found"}`.
+
+On success the validated payload is stored as individual columns in
+`professional_info` and returned directly with `200`.
+
+`PATCH /instructor/api/v1/professional_info` accepts the same fields, but every
+field is optional and defaults to `null`. Only supplied non-null fields are
+updated; omitted fields are preserved. The endpoint requires an existing
+professional-info row and returns
+`404 {"detail": "Professional info not found"}` otherwise. The response is the
+full updated professional info.
+
+`GET /instructor/api/v1/professional_info` returns the professional info for the
+instructor's latest detail record. Missing detail records and professional-info
+rows return `404` with their respective messages.
 
 ## Instructor Profile Picture
 
@@ -877,9 +934,10 @@ clearing the URL.
 
 ## Instructor Registration
 
-`POST /instructor/api/v1/register` is public. It creates an instructor account,
-persists an email verification notification, and writes a transactional outbox
-row so the notification is dispatched after the database commit.
+`POST /instructor/api/v1/register` is public. It creates an instructor account
+with initial onboarding and verification-detail records, persists an email
+verification notification, and writes a transactional outbox row so the
+notification is dispatched after the database commit.
 
 Request body:
 
@@ -906,13 +964,18 @@ The endpoint:
    is added automatically.
 4. Inserts the `Instructor` with `auth_method=EMAIL` and
    `is_email_verified=False`.
-5. Inserts an email `Notification` with
+5. Inserts an `Onboard` row linked to the instructor with the default
+   `not_started` status, step `0`, and no start/completion timestamps.
+6. Inserts an `InstructorDetail` row linked to the instructor with
+   `verification_status=pending_review` and `version=1`.
+7. Inserts an email `Notification` with
    `belongs_to=INSTRUCTOR`, `template_type=email_verification`,
    `content={"link": ...}`, and `to_email`.
-6. Inserts an `Outbox` row with
+8. Inserts an `Outbox` row with
    `payload={"argument": {"notification_id": "..."}, "task_name": "process_notification"}`,
    `table="notification"`, and `ref_id=<notification UUID>`.
-7. Commits the instructor, notification, and outbox rows in one transaction.
+9. Commits the instructor, onboarding, detail, notification, and outbox rows in
+   one transaction.
 
 Successful response (`201 Created`):
 
@@ -1320,10 +1383,8 @@ SendGrid client and non-2xx response errors raise
 `ProviderServiceNotAvailbleError` spelling). Both are subclasses of
 `NotificationError` so the existing Celery retry flow handles them.
 
-`PushProvider` publishes `notification.payload` to the Kafka topic configured by
-`NOTIFICATION_TOPIC` through the singleton producer in
-`app.services.notification.pub_sub.kafka.kafka_producer`. Kafka uses
-`KAFKA_BOOTSTRAP_SERVERS`. Producer or broker errors raise
+`PushProvider` publishes `notification.payload` as JSON to the Redis pub/sub
+channel configured by `NOTIFICATION_TOPIC`. Redis publish errors raise
 `ProviderServiceNotAvailableError`.
 
 `SMSProvider` sends `notification.payload` through Termii using
@@ -1342,28 +1403,26 @@ A cached key causes the provider to return without sending again. After a
 successful send, the key is stored with the value `processed` and a 240-second
 TTL. Redis read and write failures fail open so delivery is not blocked.
 
-## WebSocket Notifications
+## SSE Push Notifications
 
-Clients connect to:
+`GET /notification/push` requires a Bearer access token and streams
+Server-Sent Events from the Redis pub/sub channel configured by
+`NOTIFICATION_TOPIC`.
 
-```text
-ws://localhost:8000/notification?token=<access-token>
-```
+The endpoint:
 
-The `authenticate_user` dependency decodes the access token, requires
-`type == "access"`, loads `session:<sessionId>` from Redis, and stores the
-session in `websocket.state.user`.
+1. Reads the authenticated user ID from the Redis session.
+2. Subscribes to the notification channel.
+3. Decodes each Redis message as JSON.
+4. Filters messages by `recipient_id`, falling back to `user_id`.
+5. Streams only matching messages as:
+   ```text
+   data: {"recipient_id": "...", "message": {...}}
+   ```
 
-- Invalid or missing tokens and missing sessions close with code `1008`.
-- Redis failures and malformed stored sessions close with code `1011`.
-
-`WebsocketNotificationManager` tracks multiple sockets per user ID and sends
-messages only to sockets whose client state is connected. Failed sockets are
-removed automatically.
-
-When `KAFKA_CONSUMER_ENABLED=true`, the API lifespan starts `KafkaConsumer`.
-It consumes `NOTIFICATION_TOPIC`, reads this payload shape, sends the message
-to the active sockets for `recipient_id`, and commits the offset:
+Malformed payloads and messages for other users are ignored. The endpoint emits
+SSE keepalive comments while idle and unsubscribes/closes the pub/sub connection
+when the client disconnects.
 
 ```json
 {
@@ -1373,9 +1432,6 @@ to the active sockets for `recipient_id`, and commits the offset:
   }
 }
 ```
-
-The consumer uses `KAFKA_CONSUMER_GROUP_ID` and runs in the API process because
-it must share the in-memory WebSocket connection registry.
 
 ## Notifications
 
@@ -1525,6 +1581,8 @@ write and let the Beat job dispatch the registered task.
 | `POST` | `/student/api/v1/register` | Register a student | Public |
 | `POST` | `/instructor/api/v1/register` | Register an instructor | Public |
 | `POST` | `/instructor/api/v1/login` | Log in or start instructor 2FA | Public |
+| `GET` | `/instructor/api/v1/` | Return instructor identity and priority verification status | Bearer token |
+| `PATCH` | `/instructor/api/v1/2fa` | Enable or disable instructor 2FA | Bearer token |
 | `POST` | `/instructor/api/v1/verify-otp` | Verify an instructor OTP challenge | Public |
 | `POST` | `/instructor/api/v1/resend-otp` | Replace an expired instructor OTP challenge | Public |
 | `GET` | `/instructor/api/v1/google` | Log in with a Google OAuth code and state | Public |
@@ -1533,9 +1591,9 @@ write and let the Beat job dispatch the registered task.
 | `PATCH` | `/instructor/api/v1/verify-email` | Verify an instructor email address | Public |
 | `POST` | `/instructor/api/v1/email` | Request an instructor password-reset email | Public |
 | `PATCH` | `/instructor/api/v1/password-reset` | Reset an instructor password | Public |
-| `POST` | `/instructor/api/v1/profile` | Create the authenticated instructor's JSON profile | Bearer token |
-| `GET` | `/instructor/api/v1/profile` | Return the authenticated instructor's JSON profile | Bearer token |
-| `PATCH` | `/instructor/api/v1/profile` | Partially update the instructor's JSON profile | Bearer token |
+| `POST` | `/instructor/api/v1/professional_info` | Create professional info for the latest instructor detail | Bearer token |
+| `GET` | `/instructor/api/v1/professional_info` | Return professional info for the latest instructor detail | Bearer token |
+| `PATCH` | `/instructor/api/v1/professional_info` | Partially update professional info | Bearer token |
 | `POST` | `/instructor/api/v1/profile-pic` | Upload or replace the instructor profile picture | Bearer token |
 | `DELETE` | `/instructor/api/v1/profile-pic` | Delete the instructor profile picture | Bearer token |
 | `POST` | `/instructor/api/v1/cover-image` | Upload or replace the instructor cover image | Bearer token |
@@ -1549,6 +1607,7 @@ write and let the Beat job dispatch the registered task.
 | `PATCH` | `/student/api/v1/verify-email` | Verify an email address | Public |
 | `POST` | `/student/api/v1/email` | Request a password-reset email | Public |
 | `PATCH` | `/student/api/v1/password-reset` | Reset a password | Public |
+| `GET` | `/notification/push` | Stream the user's push notifications over SSE | Bearer token |
 | `POST` | `/auth/api/v1/token-refresh` | Rotate tokens | Refresh cookie |
 | `GET` | `/docs` | FastAPI documentation | Bearer token |
 | `GET` | `/openapi.json` | OpenAPI schema | Bearer token |
@@ -1563,13 +1622,14 @@ The suite covers authentication, login and token issuance, Google OAuth and
 required state-based failure redirects, current-session identity, logout and
 refresh-cookie clearing, profile lookup, profile name updates, profile-picture
 validation and UUID object keys, MinIO upload and overwrite behavior, instructor
-account/profile/education/experience/payment model defaults and constraints,
+account/detail/professional-info/education/onboard/payment model defaults and
+constraints,
 instructor registration validation, instructor login and 2FA OTP challenges,
 instructor OTP verification and resend, code hashing and expiry/TTL behavior,
 instructor Google login and 2FA redirects, instructor email verification,
-instructor password reset, instructor JSON profile creation/lookup/partial
-updates, instructor profile-picture and cover-image upload/replace/delete,
-instructor
+instructor password reset, instructor overview/2FA updates, instructor
+professional-info creation/lookup/partial updates, instructor profile-picture
+and cover-image upload/replace/delete, instructor
 current-session and logout routes, role defaults and the shared session
 contract,
 token TTL and cleanup, duplicate-email, Redis and transaction failure handling,
@@ -1580,9 +1640,8 @@ configuration, session cleanup, password hashing, Redis token creation, student
 auth-method defaults, notification model defaults, Celery queue topology, lock
 handling, retry behavior, outbox dispatch and retry budgeting, DLQ republish and
 terminal failure handling, provider dispatch, email template rendering, SendGrid
-error handling, Kafka producer publishing, Kafka consumer dispatch and commits,
-Termii SMS delivery, WebSocket authentication and connection management, and
-processed-notification caching.
+error handling, Redis pub/sub push publishing, SSE notification filtering and
+cleanup, Termii SMS delivery, and processed-notification caching.
 
 ## Known Limitations
 
@@ -1593,25 +1652,25 @@ processed-notification caching.
 - There is no general-purpose notification enqueue endpoint. New producers
   should insert an `Outbox` row in the same transaction as their business
   write.
-- Kafka is not included in the Compose stack. Set `KAFKA_BOOTSTRAP_SERVERS` to
-  an existing broker for push delivery and set `KAFKA_CONSUMER_ENABLED=true`
-  to deliver Kafka messages to WebSocket clients.
-- SendGrid, Termii, and Kafka configuration defaults are placeholders and must
-  be replaced before production use.
+- SendGrid and Termii configuration defaults are placeholders and must be
+  replaced before production use.
 - There is no migration framework. Existing databases need the `notification`,
-  `outbox`, `instructor`, `instructor_profile`, `education`, `experience`,
-  `payment_info`, and `verification` tables created manually because
+  `outbox`, `instructor`, `instructor_detail`, `professional_info`, `education`,
+  `onboard`, `payment_info`, and `verification` tables created manually because
   `AUTO_CREATE_TABLES` only creates missing tables on a fresh database. Existing
   `student` tables also need `is_suspended` and `is_verified` boolean columns
   added with `NOT NULL DEFAULT false`, plus a `role` column added with
   `VARCHAR(20) NOT NULL DEFAULT 'student'`. Existing `instructor` tables need a
-  `role` column added with `VARCHAR(20) NOT NULL DEFAULT 'instructor'`. Existing
-  `instructor` tables need nullable `profile_pic_url VARCHAR(2048)`,
-  `cover_image_url VARCHAR(2048)`, and JSON `profile` columns.
-  Existing `instructor_profile` tables need `linkedin_url`, `email`, and
-  `profile_pic_url` dropped, nullable JSON `social_links` added, `company` made
-  nullable, and `bio` changed to `VARCHAR(1000)`. If an earlier schema exists,
-  drop the unused `release_after` column manually.
+  `role` column added with `VARCHAR(20) NOT NULL DEFAULT 'instructor'`, plus
+  nullable `profile_pic_url VARCHAR(2048)` and `cover_image_url VARCHAR(2048)`
+  columns; the old JSON `profile` column should be dropped after migrating data
+  into `professional_info`. Existing `professional_info` and `education` tables
+  need an `instructor_id UUID NOT NULL` column backfilled from
+  `instructor_detail`. The separate `instructor_profile` and `experience`
+  tables are removed and should be dropped. The `education` table should be
+  dropped/recreated with `instructor_detail_id` and the new enum. Existing
+  education data requires a manual backfill through `instructor_detail`. If an
+  earlier schema exists, drop the unused `release_after` column manually.
 
 ## License
 

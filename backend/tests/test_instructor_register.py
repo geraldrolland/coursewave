@@ -12,7 +12,14 @@ from sqlalchemy.exc import IntegrityError
 from app.base_dependencies import get_session
 from app.main import create_app
 from app.security import verify_hash
-from app.services.instructor.model import AuthMethod, Instructor
+from app.services.instructor.model import (
+    AuthMethod,
+    Instructor,
+    InstructorDetail,
+    InstructorVerificationStatus,
+    Onboard,
+    OnboardingStatus,
+)
 from app.services.instructor.utils import (
     VERIFICATION_TOKEN_TTL_SECONDS,
     build_verification_link,
@@ -143,10 +150,12 @@ def test_registration_creates_instructor_notification_and_outbox() -> None:
     )
 
     instructor = find_added(session, Instructor)
+    onboard = find_added(session, Onboard)
+    instructor_detail = find_added(session, InstructorDetail)
     notification = find_added(session, Notification)
     outbox = find_added(session, Outbox)
 
-    assert len(session.added) == 3
+    assert len(session.added) == 5
     assert response.json()["instructor_id"] == str(instructor.instructor_id)
     assert instructor.email == "ada@example.com"
     assert instructor.is_email_verified is False
@@ -155,6 +164,20 @@ def test_registration_creates_instructor_notification_and_outbox() -> None:
     assert instructor.password_hash is not None
     assert instructor.password_hash != VALID_PAYLOAD["password"]
     assert verify_hash(VALID_PAYLOAD["password"], instructor.password_hash)
+
+    assert onboard.instructor_id == instructor.instructor_id
+    assert onboard.is_onboarded is False
+    assert onboard.onboarding_status is OnboardingStatus.NOT_STARTED
+    assert onboard.onboarding_step == 0
+    assert onboard.onboarding_started_at is None
+    assert onboard.onboarding_completed_at is None
+
+    assert instructor_detail.instructor_id == instructor.instructor_id
+    assert (
+        instructor_detail.verification_status
+        is InstructorVerificationStatus.PENDING_REVIEW
+    )
+    assert instructor_detail.version == 1
 
     assert session.flushed is True
     assert session.committed is True

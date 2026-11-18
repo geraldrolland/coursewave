@@ -20,10 +20,11 @@ requested refinements:
   endpoint.
 - A protected profile lookup returning the student's names, email, and profile
   picture URL.
-- Instructor account, profile, education, experience, and payment-information
-  SQLModels with email verification, optional 2FA, email/Google auth, JSON
-  expertise, and degree enums, plus public email/password registration and login
-  routes with optional email OTP two-factor authentication.
+- Instructor account, detail, professional-info, education, and
+  payment-information SQLModels with email verification, optional 2FA,
+  email/Google auth, verification/degree/gender enums, and JSON expertise/social
+  links, plus public email/password registration and login routes with optional
+  email OTP two-factor authentication.
 - A complete instructor authentication suite: OTP verification and resend,
   Google login, email verification, password-reset email/reset, current session,
   and logout.
@@ -37,11 +38,11 @@ requested refinements:
 - A notification model and Celery task backed by RabbitMQ queues, Redis locks,
   retries, and a dead-letter queue.
 - A typed Jinja email template manager for OTP and email verification messages,
-  plus a notification provider registry with SendGrid email, Kafka push, and
-  Termii SMS delivery.
-- Authenticated WebSocket notifications fed by a Kafka consumer.
+  plus a notification provider registry with SendGrid email, Redis pub/sub push,
+  and Termii SMS delivery.
+- Authenticated Server-Sent Events push notifications at /notification/push.
 - The backend is the public API; api_gateway/ has been deleted.
-- RabbitMQ handles Celery tasks; Kafka handles push notification fan-out.
+- RabbitMQ handles Celery tasks; Redis pub/sub handles push notification fan-out.
 - No Docker containers are started during development/validation.
 
 
@@ -289,13 +290,9 @@ Notification Providers
 - SendGrid settings use SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, and
   SENDGRID_FROM_NAME, with placeholder defaults.
 - PushProvider inherits NotificationCacheMixin and BaseProvider. It publishes
-  notification.payload to the Kafka notification_topic through the singleton
-  producer in
-  backend/app/services/notification/pub_sub/kafka/kafka_producer.py.
-- Kafka settings use notification_topic (default "notification") and
-  kafka_bootstrap_servers (default "localhost:9092").
-- The Kafka producer lazily creates a kafka-python KafkaProducer with a JSON
-  value serializer, acks="all", and retries=3. send() waits for the future.
+  notification.payload as JSON to the Redis pub/sub channel named by
+  notification_topic (default "notification") using the synchronous Redis
+  client. Redis publish errors become ProviderServiceNotAvailableError.
 - SMSProvider inherits NotificationCacheMixin and BaseProvider and sends
   notification.payload through the Termii SDK (termii-client). It fills
   from/type/channel defaults from settings and caches successful sends.
@@ -310,26 +307,19 @@ Notification Providers
   only after a successful send.
 - Redis cache read/write failures fail open and log a warning.
 
-WebSocket Notifications
-- New package at backend/app/services/notification/ws/.
-- WebSocket route: /notification?token=<access-token>.
-- authenticate_user decodes the access token, requires type=access, loads
-  session:<sessionId> from Redis, and stores the session in
-  websocket.state.user.
-- Close codes: 1008 for missing/invalid tokens, wrong token type, invalid
-  session ID, or missing session; 1011 for Redis or stored-session failures.
-- WebsocketNotificationManager keeps connections as
-  {user_id: list[WebSocket]}. register appends, remove deletes, and async send
-  only targets WebSocketState.CONNECTED sockets.
-- The endpoint registers the socket, sleeps in a loop, and removes the socket in
-  finally. WEBSOCKET_SLEEP_SECONDS is 30.
-- KafkaConsumer in pub_sub/kafka/kafka_consumer.py subscribes to
-  notification_topic, parses messages, reads recipient_id and message, calls the
-  WebSocket manager send, and commits offsets.
-- Consumer settings: kafka_consumer_enabled (default false) and
-  kafka_consumer_group_id (default coursewave-notification-websockets).
-- The FastAPI lifespan starts/stops KafkaConsumer when enabled. Kafka polling
-  and commits run on a dedicated single-thread executor.
+SSE Push Notifications
+- New router at backend/app/services/notification/router/__init__.py with prefix
+  /notification.
+- GET /notification/push is protected by AuthMiddleware and streams
+  text/event-stream responses.
+- The endpoint reads the authenticated user ID from request.state.user, creates
+  an async Redis pubsub client, subscribes to notification_topic, and filters
+  messages by recipient_id (falling back to user_id).
+- Malformed and non-matching messages are skipped. Idle connections receive SSE
+  keepalive comments. The pubsub subscription is unsubscribed and closed in a
+  finally block.
+- Redis pub/sub replaces Kafka; there is no WebSocket notification manager or
+  Kafka consumer lifecycle.
 
 Instructor Models
 - CourseWave has a separate instructor service at backend/app/services/instructor/
@@ -344,50 +334,72 @@ Instructor Models
     password_hash: nullable str, default null, max 255 characters
     profile_pic_url: nullable str, default null, max 2048 characters
     cover_image_url: nullable str, default null, max 2048 characters
-    profile: nullable JSON object, default null
     auth_method: AuthMethod EMAIL = "email", GOOGLE = "google"; defaults to
                  EMAIL and is non-null
     created_at / updated_at: timezone-aware datetimes
-- InstructorProfile (table "instructor_profile") fields:
-    profile_id: UUID primary key (uuid4)
-    instructor_id: UUID, required, unique, indexed, FK to
-                   instructor.instructor_id
+- InstructorDetail (table "instructor_detail") fields:
+    id: UUID primary key (uuid4)
+    instructor_id: UUID, required, indexed, FK to instructor.instructor_id
+                   (not unique, so an instructor can have multiple details)
+    verification_status: InstructorVerificationStatus PENDING_REVIEW =
+                         "pending_review", UNDER_REVIEW = "under_review",
+                         REJECTED = "rejected", VERIFIED = "verified";
+                         defaults to PENDING_REVIEW
+    version: integer, default 1
+    created_at / updated_at: timezone-aware datetimes
+- ProfessionalInfo (table "professional_info") fields:
+    id: UUID primary key (uuid4)
+    instructor_id: UUID, required, indexed, FK to instructor.instructor_id
+    instructor_detail_id: UUID, required, unique, indexed, FK to
+                          instructor_detail.id (one-to-one)
     first_name: required, max 100 characters
     middle_name: nullable, default null, max 100 characters
     last_name: required, max 100 characters
     gender: Gender MALE = "male", FEMALE = "female"; required
     country_of_residence: required, max 100 characters
-    state: nullable, default null, max 100 characters
+    state: required, max 100 characters
     city: required, max 100 characters
     bio: required, max 1000 characters
     headline: required, max 255 characters
-    expertise: required JSON list[str], e.g. ["tech", "science"]
+    expertise: required JSON list[str]
     years_of_exp: required int
     current_occupation: required, max 255 characters
     company: nullable, default null, max 255 characters
-    social_links: nullable JSON list[dict[str, str]], default null
+    social_links: required JSON list[dict[str, str]]
     created_at / updated_at: timezone-aware datetimes
 - Education (table "education") fields:
-    education_id: UUID primary key (uuid4)
+    id: UUID primary key (uuid4)
+    instructor_id: UUID, required, indexed, FK to instructor.instructor_id
+    instructor_detail_id: UUID, required, unique, indexed, FK to
+                          instructor_detail.id (one-to-one)
+    institution_name: required, max 255 characters
+    degree_type: DegreeType HIGH_SCHOOL = "high_school",
+                 DIPLOMA = "diploma", ASSOCIATE = "associate",
+                 BACHELORS = "bachelors",
+                 POSTGRADUATE_DIPLOMA = "postgraduate_diploma",
+                 MASTERS = "masters", DOCTORATE = "doctorate",
+                 PROFESSIONAL_CERTIFICATION = "professional_certification",
+                 OTHER = "other"; required
+    field_of_study: required, max 255 characters
+    major: nullable, default null, max 255 characters
+    minor: nullable, default null, max 255 characters
+    start_date: nullable SQL Date, default null
+    end_date: nullable SQL Date, default null
+    is_currently_studying: bool, default false
+    grade: nullable, default null, max 100 characters
+    description: nullable SQL Text, default null
+    created_at / updated_at: timezone-aware datetimes
+- Onboard (table "onboard") fields:
+    id: UUID primary key (uuid4)
     instructor_id: UUID, required, unique, indexed, FK to
                    instructor.instructor_id
-    school: required, max 255 characters
-    course: required, max 255 characters
-    degree: Degree DOCTORATE = "doctorate", MASTERS = "masters",
-            BACHELOR = "bachelor", ASSOCIATE = "associate",
-            DIPLOMA = "diploma"; required
-    graduate_at: required MM/YYYY string, e.g. 09/2024
-    created_at / updated_at: timezone-aware datetimes
-- Experience (table "experience") fields:
-    experience_id: UUID primary key (uuid4)
-    instructor_id: UUID, required, indexed, FK to instructor.instructor_id
-                   (not unique, so an instructor can have many entries)
-    company_name: required, max 255 characters
-    started_at: required MM/YYYY string
-    ended_at: nullable MM/YYYY string, default null
-    till_present: bool, default false
-    role: required, max 255 characters
-    created_at / updated_at: timezone-aware datetimes
+    is_onboarded: bool, default false
+    onboarding_status: OnboardingStatus NOT_STARTED = "not_started",
+                       IN_PROGRESS = "in_progress", COMPLETED = "completed";
+                       defaults to NOT_STARTED
+    onboarding_step: integer, default 0
+    onboarding_started_at: nullable timezone-aware datetime, default null
+    onboarding_completed_at: nullable timezone-aware datetime, default null
 - PaymentInfo (table "payment_info") fields:
     payment_info_id: UUID primary key (uuid4)
     instructor_id: UUID, required, unique, indexed, FK to
@@ -397,12 +409,12 @@ Instructor Models
     bank: required, max 255 characters
     version_num: integer, default 1
     created_at / updated_at: timezone-aware datetimes
-- Database enum names are instructor_auth_method, instructor_gender, and
-  education_degree; all store lowercase values.
-- MM/YYYY field values are stored as plain strings. The models intentionally
-  contain no custom validation; callers are expected to validate the format
-  separately.
-- All five instructor models are imported in app/main.py so
+- Database enum names are instructor_auth_method,
+  instructor_detail_verification_status, professional_info_gender,
+  education_degree_type, and onboarding_status; all store lowercase values.
+- Education dates use SQL Date. The models intentionally contain no custom
+  validation; callers are expected to validate input separately.
+- All six instructor models are imported in app/main.py so
   SQLModel.metadata.create_all creates their tables on a fresh database.
 
 Instructor Registration
@@ -414,6 +426,10 @@ Instructor Registration
   instructor service rather than imported from the student service.
 - The endpoint creates an Instructor with auth_method=EMAIL,
   is_email_verified=False, and an Argon2 password hash.
+- Immediately after the instructor flush, it creates an Onboard row with the
+  default not_started status, step 0, and null start/completion timestamps.
+- It also creates an InstructorDetail row with verification_status=pending_review
+  and version=1.
 - It stores token -> instructor UUID in Redis with a 120-second TTL and builds
   {APP_HOST}/email-verification?token={token}, using the same frontend path as
   student registration.
@@ -421,7 +437,8 @@ Instructor Registration
   template_type=email_verification, content={"link": ...}, and to_email.
 - It creates an Outbox row with table="notification", ref_id=<notification UUID>,
   and the standard process_notification payload.
-- The Instructor, Notification, and Outbox rows commit in one transaction.
+- The Instructor, Onboard, InstructorDetail, Notification, and Outbox rows commit
+  in one transaction.
 - Success is 201 with instructor_id and "Registration successful. Please verify
   your email." Duplicate email is 409, Redis failure is 503, and validation
   failure is 422. The Redis token is deleted on a best-effort basis if the
@@ -485,28 +502,42 @@ Instructor OTP Resend
   503 "Authentication service unavailable". Commit failures roll back and delete
   the expired token on a best-effort basis.
 
-Instructor JSON Profile
-- POST /instructor/api/v1/profile is protected and accepts a JSON payload.
-- Pydantic validation requires first_name, last_name, gender, country_of_residence,
-  state, city, bio (max 1000), headline, expertise (non-empty list), years_of_exp
-  (integer > 0), current_occupation, and social_links (non-empty list).
-- middle_name and company are optional. gender is Literal["male", "female"].
-- Every social_links object must contain at least one of linkedin or x, with
-  HttpUrl validation.
-- Extra fields are rejected. The endpoint loads the authenticated instructor and
-  returns 404 when missing.
-- If instructor.profile is already set, it returns 403 "Instructor profile
-  already exists". Otherwise it stores the payload as JSON (excluding None
-  values), commits, and returns the validated profile directly.
-- PATCH /instructor/api/v1/profile accepts the same fields all optional with
-  None defaults. Missing profiles return 404 "Instructor profile not found".
-  Omitted or explicit-null fields are ignored; supplied non-null fields merge
-  into the stored JSON profile. The full merged profile is validated with
-  InstructorProfileCreateRequest and returned.
-- GET /instructor/api/v1/profile returns the stored JSON profile. Missing
-  profiles return 404 "Instructor profile not found"; missing instructors return
-  404 "Instructor not found". The response is validated with
-  InstructorProfileCreateRequest and excludes None values.
+Instructor Overview and 2FA
+- GET /instructor/api/v1/ is protected and returns instructor_id, email,
+  is_2fa_enabled, profile_pic_url, cover_image_url, and the selected
+  verification_status.
+- InstructorDetail rows are ordered by version descending. The selected status
+  priority is under_review, pending_review, verified, then rejected (the
+  requested failed fallback). No details returns 404 "Instructor detail not
+  found".
+- PATCH /instructor/api/v1/2fa accepts exactly {"status": <bool>} with Pydantic
+  strict boolean validation. Matching status returns "2FA already enabled" or
+  "2FA already disabled" without committing. Otherwise it updates
+  Instructor.is_2fa_enabled, commits, and returns "2FA enabled successfully" or
+  "2FA disabled successfully".
+
+Instructor Professional Info
+- POST /instructor/api/v1/professional_info is protected and accepts the
+  Pydantic profile payload.
+- The endpoint resolves the instructor's latest InstructorDetail by created_at.
+  Missing instructors return 404 "Instructor not found"; missing detail records
+  return 404 "Instructor detail not found".
+- It creates a ProfessionalInfo row with the payload columns, Gender enum,
+  JSON expertise/social_links, instructor_id, and instructor_detail_id. If
+  professional info already exists for that detail, it returns 403 "Professional
+  info already exists".
+- Creation locks the instructor's Onboard row with SELECT FOR UPDATE, increments
+  onboarding_step, and sets status to completed + is_onboarded=true at step 6,
+  otherwise not_started becomes in_progress. The onboard update and
+  professional-info insert commit atomically. Missing onboard returns 404
+  "Onboard record not found".
+- PATCH /instructor/api/v1/professional_info accepts the same all-optional
+  payload, ignores omitted/null values, updates supplied non-null columns, and
+  returns the full updated record. Missing info returns 404 "Professional info
+  not found".
+- GET /instructor/api/v1/professional_info returns the latest detail's
+  professional info, or 404 when the detail/info is missing. Responses use
+  InstructorProfileCreateRequest and exclude None values.
 
 Instructor Profile Picture
 - POST /instructor/api/v1/profile-pic is protected and multipart. It accepts
@@ -660,7 +691,7 @@ Prior decisions that remain in place
   Student, Notification, and Outbox in one transaction.
 - New error bodies use {"detail": "..."}.
 - Compose service is named coursewave, builds ./backend, publishes 3000:8000.
-- RabbitMQ handles Celery; Kafka is used only for push notifications;
+- RabbitMQ handles Celery; Redis pub/sub handles push notifications;
   api_gateway/ is removed.
 - Refresh is BaseHTTPMiddleware handling POST /auth/api/v1/token-refresh.
 - Auth, Cache, RateLimit, RefreshToken, and RequestLogger are all Starlette
@@ -720,19 +751,14 @@ Completed
   integrated processed-notification cache checks and writes into EmailProvider.
 - Removed Notification.send and updated process_notification to resolve and
   invoke the provider from ProviderManager.
-- Added the pub_sub Kafka producer singleton, PushProvider with cache support,
-  SMSProvider backed by Termii, and registered push/sms providers.
-- Added Kafka and Termii settings, dependencies, environment examples, and
-  producer/provider tests.
+- Added PushProvider with Redis pub/sub publishing and cache support, SMSProvider
+  backed by Termii, and registered push/sms providers.
+- Added Termii settings, dependencies, environment examples, and provider tests.
 - Extended NotificationCacheMixin to SMSProvider, including cache skips and
   successful-send writes.
-- Moved kafka_producer.py into pub_sub/kafka/ and added KafkaConsumer.
-- Added the ws package with /notification, authenticate_user,
-  WebsocketNotificationManager, and Kafka-to-WebSocket delivery.
-- Wired the WebSocket router and optional Kafka consumer lifecycle into the
-  FastAPI app.
-- Replaced the deprecated httpx TestClient dependency with httpx2 and added
-  targeted pytest filters for kafka-python's importlib.resources warnings.
+- Added the /notification/push SSE router with authenticated Redis pub/sub
+  subscription, user filtering, keepalives, and cleanup.
+- Replaced Kafka/WebSocket notification delivery with Redis pub/sub and SSE.
 - Added the task.retry queue, DLQ_MAX_RETRIES/TASK_RETRY_TTL_SECONDS constants,
   shared DEATH_HEADERS, and the declare_all_queues helper to celery_app.
 - Changed process_notification to reject provider failures with
@@ -798,12 +824,15 @@ Completed
   Invalid session IDs return 401 and a missing student returns 404.
 - Added instructor SQLModels: Instructor (unique required email,
   verification/2FA defaults, nullable password_hash, AuthMethod),
-  InstructorProfile (separate profile_id, unique instructor_id FK,
-  Gender, required profile fields, JSON expertise), Education (unique
-  instructor_id FK, degree enum, MM/YYYY graduate_at), Experience (indexed
-  instructor_id FK, MM/YYYY started_at/ended_at, till_present), and PaymentInfo
-  (unique instructor_id FK, version_num), and registered all five for table
-  creation.
+  InstructorDetail (non-unique instructor_id FK, verification status, version),
+  ProfessionalInfo (one-to-one instructor_detail_id FK with the JSON profile
+  columns), Education (unique instructor_detail_id FK, institution_name,
+  DegreeType, field_of_study, optional major/minor/date/grade/description,
+  is_currently_studying), PaymentInfo (unique instructor_id FK, version_num),
+  and Onboard (unique instructor_id FK, onboarding status/step/timestamps), and
+  registered all six for table creation. The separate InstructorProfile and
+  Experience models were removed; professional profile data is stored in
+  ProfessionalInfo columns.
 - Added Student.is_suspended and Student.is_verified, both defaulting to false.
 - Added the Verification SQLModel with a UUID id, indexed instructor_id FK, JSON
   id_verification/academic_verification, VerificationStatus defaulting to
@@ -811,10 +840,10 @@ Completed
   registered it for table creation.
 - Added public POST /instructor/api/v1/register with instructor-local schema
   validation, a 120-second Redis verification token, the shared
-  /email-verification link path, and Instructor + email Notification + Outbox
-  insertion in one transaction. Added the route to the default auth exclude
-  paths, .env.example, and docker-compose.yml, and included the instructor router
-  in app/main.py.
+  /email-verification link path, and Instructor + Onboard + InstructorDetail +
+  email Notification + Outbox insertion in one transaction. Added the route to
+  the default auth exclude paths, .env.example, and docker-compose.yml, and
+  included the instructor router in app/main.py.
 - Added public POST /instructor/api/v1/login with normalized email/password
   validation, generic invalid-credential errors, resend-verification handling,
   instructor Redis sessions and refresh cookies, and optional 2FA. The 2FA flow
@@ -842,7 +871,7 @@ Completed
   and changed both login-session builders to store exactly
   {"id": ..., "email": ..., "role": ...}.
 - Updated session consumers to read id: the student auth helper, student /me,
-  rate-limit identifier, WebSocket authentication, and WebSocket registration.
+  rate-limit identifier, and notification SSE authentication.
 - Added instructor schemas for OTP verification/resend, email verification, reset
   email, password reset, message responses, and /me.
 - Added instructor utilities for password-reset links, action-token lookup,
@@ -871,25 +900,39 @@ Completed
   idempotent empty-state handling, and MinIO failure handling.
 - Added POST/DELETE /instructor/api/v1/cover-image with the same validation and
   lifecycle as profile-pic, using the coverimages bucket and cover_image_url.
-- Added POST /instructor/api/v1/profile with Pydantic JSON validation,
-  Literal gender values, HttpUrl social links, Instructor.profile storage, and
-  403 handling for existing profiles.
-- Added PATCH /instructor/api/v1/profile with all-optional Pydantic fields,
-  non-null-only merging, 404 handling for missing profiles, full merged-profile
-  validation, and commit rollback.
-- Added GET /instructor/api/v1/profile with stored-profile lookup, 404 handling
-  for missing profiles/instructors, validated responses, and no writes.
+- Added GET /instructor/api/v1/ with latest-version detail ordering and
+  under_review/pending_review/verified/rejected status priority.
+- Added PATCH /instructor/api/v1/2fa with strict boolean validation, idempotent
+  already-enabled/disabled responses, update commits, and rollback.
+- Added POST /instructor/api/v1/professional_info with Pydantic validation,
+  latest-InstructorDetail resolution, ProfessionalInfo column storage, Gender
+  enum conversion, JSON expertise/social_links, and 403 handling for existing
+  records.
+- Added PATCH /instructor/api/v1/professional_info with all-optional Pydantic
+  fields, non-null-only column updates, 404 handling, and commit rollback.
+- Added GET /instructor/api/v1/professional_info with ProfessionalInfo lookup,
+  404 handling for missing details/records, and validated responses.
+- Added instructor_id FKs to ProfessionalInfo and Education alongside their
+  unique instructor_detail_id relationships.
+- Professional-info POST now locks the instructor's Onboard row with
+  SELECT FOR UPDATE, increments onboarding_step, moves not_started to
+  in_progress, and marks completed/is_onboarded=true when the step reaches 6.
 - Added minio_cover_bucket (coverimages), MINIO_COVER_BUCKET environment
   examples, Compose environment, and coverimages bucket creation in minio-init.
-- Updated InstructorProfile: bio max 1000, nullable company, nullable JSON
-  social_links, and removed linkedin_url and email.
+- Removed the separate InstructorProfile model/table.
+- Replaced Education with the new institution/degree/field-of-study schema,
+  DegreeType enum, SQL Date fields, Text description, instructor_id FK, and
+  one-to-one instructor_detail_id FK.
+- Replaced Kafka/WebSocket notification delivery with Redis pub/sub publishing
+  and the authenticated /notification/push SSE stream.
 - Added the new public instructor paths to base_config.py, backend/.env.example,
   and docker-compose.yml; /me and /logout remain protected.
 - Added tests/instructor_fakes.py and test_instructor_verify_otp.py,
   test_instructor_resend_otp.py, test_instructor_google.py,
   test_instructor_verify_email.py, test_instructor_password_reset.py,
-  test_instructor_me.py, test_instructor_logout.py, test_instructor_profile.py,
-  test_instructor_profile_pic.py, and test_instructor_cover_image.py.
+  test_instructor_me.py, test_instructor_logout.py,
+  test_instructor_professional_info.py, test_instructor_profile_pic.py,
+  test_instructor_cover_image.py, and test_instructor_overview.py.
 - Updated instructor login/Google/OTP tests for Argon2 code hashes, exp values,
   24-hour TTLs, POST verification, expired-token handling, and resend behavior.
 - Updated existing tests for role defaults and the exact {id, email, role}
@@ -912,44 +955,44 @@ Next Move
   and recovery, Google OAuth with required state, OTP verification and resend,
   current session, logout, roles and the shared session contract, MinIO
   profile-picture,
-  profile lookup, instructor account/profile/education/experience/payment
-  models, instructor registration and login with optional 2FA, verification
-  model, student suspension/verification flags, profile-picture overwrite, and
-  student utility extraction flows are complete and validated with unit tests.
+  profile lookup, instructor account/detail/professional-info/education/onboard/
+  payment models, instructor registration and login with optional 2FA,
+  onboarding step/status transitions, Redis pub/sub push plus SSE streaming,
+  verification model, student suspension/verification flags, profile-picture
+  overwrite, and student utility extraction flows are complete and validated
+  with unit tests.
 
 
 Known Gaps
 - There is no general-purpose notification enqueue endpoint. New producers
   should insert an Outbox row in the same transaction as their business write.
-- Kafka is not included in docker-compose.yml; push delivery and WebSocket
-  fan-out require an external broker configured by
-  kafka_bootstrap_servers.
-- KAFKA_CONSUMER_ENABLED defaults to false; set it to true to start the
-  Kafka-to-WebSocket consumer.
-- SendGrid, Termii, Kafka, and Google OAuth defaults are placeholders that must
-  be replaced.
+- SendGrid, Termii, and Google OAuth defaults are placeholders that must be
+  replaced.
 - Password reset does not invalidate existing access or refresh sessions.
 - OTP challenges created before the hashed-challenge change use the old plaintext
   otp_code payload and are rejected; affected instructors must log in again.
 - No migration framework exists. Existing databases need the notification,
-  outbox, instructor, instructor_profile, education, experience, payment_info,
-  and verification tables created manually because create_all only creates
-  missing tables on a fresh database. Existing student tables also need
+  outbox, instructor, instructor_detail, professional_info, education, onboard,
+  payment_info, and verification tables created manually because create_all only
+  creates missing tables on a fresh database. Existing student tables also need
   is_suspended and is_verified boolean columns added with NOT NULL DEFAULT false,
   plus role VARCHAR(20) NOT NULL DEFAULT 'student'. Existing instructor tables
-  need role VARCHAR(20) NOT NULL DEFAULT 'instructor'. Existing
-  instructor tables need nullable profile_pic_url VARCHAR(2048), cover_image_url
-  VARCHAR(2048), and JSON profile columns.
-  Existing instructor_profile tables need linkedin_url, email, and
-  profile_pic_url dropped, nullable JSON social_links added, company made
-  nullable, and bio changed to VARCHAR(1000). If the earlier schema exists, drop
-  the unused release_after column manually.
+  need role VARCHAR(20) NOT NULL DEFAULT 'instructor', nullable
+  profile_pic_url VARCHAR(2048), and cover_image_url VARCHAR(2048) columns. The
+  old instructor profile JSON column should be dropped after migrating data into
+  professional_info. The old instructor_profile and experience tables should be
+  dropped. The professional_info and education tables also need instructor_id
+  UUID NOT NULL columns backfilled from instructor_detail. The education table
+  should be dropped/recreated with instructor_detail_id and the
+  education_degree_type enum. Existing education data requires a manual backfill
+  through instructor_detail. If the earlier schema exists, drop the
+  unused release_after column manually.
 
 
 Validation Results
 ------------------
-- pytest -q: 567 passed, no warnings.
-- Instructor-focused suite (pytest -k instructor): 205 passed.
+- pytest -q: 575 passed, no warnings.
+- Instructor-focused suite (pytest -k instructor): 227 passed.
 - compileall: passed.
 - pip check: no broken requirements.
 - git diff --check: passed; Git reported only LF-to-CRLF checkout warnings.
@@ -959,12 +1002,10 @@ Validation Results
   SMSProvider.
 - Processed-notification cache stores value=processed with a 240-second TTL,
   skips cached notifications, and fails open on Redis errors.
-- KafkaProducer is a lazy singleton with JSON serialization and send futures;
-  PushProvider and SMSProvider tests cover success and failure paths.
-- WebSocket endpoint tests cover valid sessions, all 1008/1011 close paths,
-  connection registration, and scope user data.
-- Kafka consumer tests cover payload dispatch, invalid messages, and offset
-  commits.
+- PushProvider tests cover Redis channel publishing, cache skips/writes, invalid
+  payloads, JSON-string payloads, and Redis failure wrapping.
+- SSE endpoint tests cover authenticated subscription, user filtering,
+  malformed/unidentified message skipping, and pub/sub cleanup.
 - Celery import prints: notification.process_notification and task.
 - Queue inspection prints:
     task.dlq: topic exchange task.dlx, quorum, x-delivery-limit=-1
@@ -991,10 +1032,16 @@ Validation Results
   against the coverimages bucket, strict multipart validation, auth and
   instructor errors, MinIO/commit failures, delete/idempotent behavior, and
   cleanup.
-- Instructor JSON profile tests cover direct response/storage, GET lookup,
-  missing-profile 404s, partial merge updates, optional fields, social-link
-  rules, lowercase Literal gender, expertise/year bounds, existing/missing-
-  profile handling, invalid payloads, auth/instructor errors, and rollback.
+- Instructor professional-info tests cover POST model creation on the latest
+  detail, GET lookup, PATCH column updates, missing-detail/info 404s, optional
+  fields, social-link rules, gender/expertise/year validation, auth/instructor
+  errors, and rollback.
+- Instructor overview/2FA tests cover status priority, version ordering, no-detail
+  handling, payload shape, idempotent 2FA messages, strict boolean validation,
+  updates, and rollback.
+- Professional-info POST tests cover the locked onboard row, step increments,
+  not_started -> in_progress, step-6 completion, status preservation, missing
+  onboard, and atomic commit behavior.
 - docker compose config could not be run because the Docker CLI is not
   installed. The Compose YAML was parsed with PyYAML and contains:
   coursewave, worker, dlq-consumer, postgres, redis, rabbitmq.
@@ -1008,16 +1055,15 @@ Relevant Files
 - backend/app/base_config.py
   Settings, DEFAULT_AUTH_EXCLUDE_PATHS (including the public instructor auth
   paths), DEFAULT_RATELIMIT_ROUTES, ratelimit_routes native list, rabbitmq_url,
-  SendGrid, PostgreSQL, Kafka producer/consumer, Termii, and Redis settings plus
+  SendGrid, PostgreSQL, Redis pub/sub channel, Termii, and Redis settings plus
   split_csv helper.
 - backend/app/base_utils/__init__.py
   Shared utc_now helper used by the student and notification models.
 - backend/app/redis_config/__init__.py
   Async and synchronous Redis client factories built from Settings.
 - backend/app/main.py
-  create_app, lifespan, Redis provider, student/instructor route registration,
-  middleware order, Notification import for table creation, WebSocket router
-  inclusion, and optional Kafka consumer startup/shutdown.
+  create_app, lifespan, Redis provider, student/instructor/notification route
+  registration, middleware order, and Notification import for table creation.
 - backend/app/security.py
   Argon2, JWT creation/verification, duration parsing, Express-compatible
   signed-cookie helpers.
@@ -1033,11 +1079,20 @@ Relevant Files
 - backend/app/middleware/request_logger.py
   BaseHTTPMiddleware request logging.
 - backend/app/services/instructor/model/education.py
-  Education SQLModel with Degree enum, unique instructor_id FK, school, course,
-  and an MM/YYYY-form graduate_at string; no model-level validation.
-- backend/app/services/instructor/model/experience.py
-  Experience SQLModel with indexed instructor_id FK, company_name, MM/YYYY
-  started_at/ended_at, till_present, and role.
+  Education SQLModel with UUID id, instructor_id FK, unique
+  instructor_detail_id FK, institution_name, DegreeType enum, field_of_study,
+  optional major/minor/date/grade/description fields, is_currently_studying, and
+  timestamps.
+- backend/app/services/instructor/model/instructor_detail.py
+  InstructorDetail SQLModel with UUID id, indexed non-unique instructor_id FK,
+  InstructorVerificationStatus, version, and timestamps.
+- backend/app/services/instructor/model/professional_info.py
+  ProfessionalInfo SQLModel with UUID id, instructor_id FK, unique
+  instructor_detail_id FK, all JSON profile columns, Gender enum, JSON
+  expertise/social_links, and timestamps.
+- backend/app/services/instructor/model/onboard.py
+  Onboard SQLModel with UUID id, unique indexed instructor_id FK, onboarding
+  status/step, and optional started/completed timestamps.
 - backend/app/services/instructor/model/instructor.py
   Instructor SQLModel with AuthMethod, unique email, non-null role defaulting to
   "instructor", verification/2FA defaults, nullable password_hash, nullable
@@ -1045,10 +1100,6 @@ Relevant Files
 - backend/app/services/instructor/model/payment_info.py
   PaymentInfo SQLModel with unique instructor_id FK, full_name, account_number,
   bank, and version_num.
-- backend/app/services/instructor/model/profile.py
-  InstructorProfile SQLModel with separate profile_id, unique instructor_id FK,
-  Gender, required profile fields, JSON expertise, nullable JSON social_links,
-  optional company, 1000-character bio, and timestamps.
 - backend/app/services/instructor/router/instructor.py
   Instructor registration, login, OTP verification/resend, Google auth, current
   session, logout, profile-picture upload/delete, email verification,
@@ -1104,28 +1155,14 @@ Relevant Files
   ProviderType enum, email/push/sms provider instances, and the three-key
   registry.
 - backend/app/services/notification/provider/push_provider.py
-  PushProvider with Kafka publishing, cache checks/writes, payload validation,
-  and ProviderServiceNotAvailableError wrapping.
+  PushProvider with Redis channel publishing, cache checks/writes, payload
+  validation, and ProviderServiceNotAvailableError wrapping.
 - backend/app/services/notification/provider/sms_provider.py
   SMSProvider backed by Termii, cache checks/writes, payload defaults, and
   error conversion.
-- backend/app/services/notification/pub_sub/__init__.py
-  Exports KafkaProducer from the kafka subpackage.
-- backend/app/services/notification/pub_sub/kafka/__init__.py
-  Exports KafkaConsumer and KafkaProducer.
-- backend/app/services/notification/pub_sub/kafka/kafka_producer.py
-  KafkaProducer singleton, lazy kafka-python client, JSON value serializer, and
-  send(topic, payload).
-- backend/app/services/notification/pub_sub/kafka/kafka_consumer.py
-  KafkaConsumer loop, single-thread executor for blocking Kafka operations,
-  recipient/message dispatch, and offset commits.
-- backend/app/services/notification/ws/__init__.py
-  /notification WebSocket endpoint and router.
-- backend/app/services/notification/ws/authentication.py
-  authenticate_user dependency, token/session validation, and WebSocket close
-  codes.
-- backend/app/services/notification/ws/websocket_notif_manager.py
-  WebsocketNotificationManager, connection registry, and active-socket sends.
+- backend/app/services/notification/router/__init__.py
+  /notification/push SSE endpoint, authenticated Redis pub/sub subscription,
+  user filtering, keepalives, and cleanup.
 - backend/app/services/notification/task/process_notification.py
   process_notification task, lock flow, custom-header preservation, pending-only
   processing, and Reject(requeue=True) on provider failure.
@@ -1145,20 +1182,14 @@ Relevant Files
   Provider registry/manager lookup, missing providers, SendGrid delivery,
   payload variants, and error handling tests.
 - backend/tests/test_push_provider.py
-  PushProvider Kafka publishing, cache behavior, payload validation, and error
+  PushProvider Redis publishing, cache behavior, payload validation, and error
   handling.
 - backend/tests/test_sms_provider.py
   SMSProvider Termii payload defaults, cache behavior, error responses, and
   payload validation.
-- backend/tests/test_kafka_producer.py
-  KafkaProducer singleton, lazy client setup, JSON serializer, and send futures.
-- backend/tests/test_kafka_consumer.py
-  Kafka payload dispatch, invalid message handling, and offset commits.
-- backend/tests/test_ws_auth.py
-  WebSocket token/session authentication, close codes, endpoint connection, and
-  scope session data.
-- backend/tests/test_ws_manager.py
-  WebSocket registration, removal, active-only sends, and stale socket cleanup.
+- backend/tests/test_notification_push.py
+  SSE authentication, channel subscription, user filtering, malformed-message
+  skipping, and pub/sub cleanup.
 - backend/celery_app/__init__.py
   Celery app, queue/DLX/DLQ/retry declarations, shared DEATH_HEADERS, retry and
   ack settings, task routes, Beat schedule, declare_all_queues, and the
@@ -1187,19 +1218,19 @@ Relevant Files
   DLQ parsing, retry budget, republishing, poison handling, throttled
   requeues, handler binding, and mark_notif_failed state tests.
 - backend/requirements.txt
-  FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, SendGrid, kafka-python,
-  termii-client, MinIO, python-multipart, and auth dependencies.
+  FastAPI, Celery, SQLModel, Redis, asyncpg, Jinja2, SendGrid, termii-client,
+  MinIO, python-multipart, and auth dependencies.
 - backend/requirements-dev.txt
   pytest and httpx2 test dependencies.
 - backend/pytest.ini
-  Targeted filters for kafka-python importlib.resources deprecation warnings.
+  Pytest configuration.
 - backend/Dockerfile
   Installs requirements, copies app, templates, celery_app package, and dlq, and
   runs uvicorn.
 - docker-compose.yml
   coursewave, worker, beat, dlq-consumer, postgres, redis, rabbitmq, minio, and
-  minio-init; shared backend environment with SendGrid, Kafka
-  producer/consumer, Termii, and MinIO settings.
+  minio-init; shared backend environment with SendGrid, Redis pub/sub,
+  Termii, and MinIO settings.
 - backend/app/services/storage/minio.py
   MinIO client factory, profile-picture and cover-image object-key/URL helpers,
   upload, and delete operations.
@@ -1207,14 +1238,19 @@ Relevant Files
   Profile lookup, name updates, multipart upload validation, UUID object keys,
   existing-key overwrite behavior, and MinIO/database failure handling.
 - backend/tests/test_instructor_model.py
-  Instructor, InstructorProfile, Education, Experience, and PaymentInfo
-  defaults, nullability, unique constraints, enum names/values, JSON expertise,
-  JSON profile, and foreign-key targets.
-- backend/tests/test_instructor_profile.py
-  JSON profile creation/lookup/response storage, partial merge updates, optional
-  fields, social-link validation, Literal gender, expertise/year bounds,
-  existing/missing-profile handling, auth and instructor errors, invalid
-  payloads, and commit rollback.
+  Instructor, InstructorDetail, ProfessionalInfo, Education, Onboard, and
+  PaymentInfo defaults, nullability, constraints, enum names/values, DegreeType
+  values, Date/Text columns, JSON expertise/social links, and foreign-key
+  targets.
+- backend/tests/test_instructor_professional_info.py
+  ProfessionalInfo creation on the latest detail, onboarding step/status
+  transitions and SELECT FOR UPDATE, GET/PATCH behavior, column updates,
+  missing detail/info/onboard handling, social-link/gender/expertise/year
+  validation, auth/instructor errors, invalid payloads, and commit rollback.
+- backend/tests/test_instructor_overview.py
+  Overview payload/status priority, version ordering, missing/auth/instructor
+  errors, 2FA unchanged/updated messages, strict boolean validation, and commit
+  rollback.
 - backend/tests/test_instructor_register.py
   Instructor registration success, normalized email, password hashing,
   notification/outbox payloads, Redis token TTL, HTTPS links, duplicate email,
@@ -1263,7 +1299,7 @@ Relevant Files
   rejected_reason, instructor FK target, and absent verified_by FK.
 - backend/README.md and README.md
   Architecture, middleware, auth, cache, rate-limit, profile-picture and MinIO,
-  notification, provider, WebSocket, Celery, Kafka, Termii, and testing
+  notification, provider, SSE, Celery, Redis pub/sub, Termii, and testing
   documentation.
 - api_gateway/
   Deleted.
@@ -1324,14 +1360,17 @@ Important Context
   email notification and outbox row, commits them together, and returns 200
   {"message": "OTP resent successfully"}. Missing instructors return 404; Redis
   failures return 503.
-- Instructor JSON profile: POST /instructor/api/v1/profile is protected and
-  validates the profile payload with Pydantic. It stores the JSON profile on the
-  instructor when none exists and returns the validated payload; existing
-  profiles return 403 "Instructor profile already exists". PATCH
-  /instructor/api/v1/profile accepts optional fields, ignores omitted/null
-  values, merges non-null updates into the stored JSON, requires an existing
-  profile (404 otherwise), and returns the full updated profile. GET
-  /instructor/api/v1/profile returns the stored profile or 404 when absent.
+- Instructor overview: GET /instructor/api/v1/ returns instructor identity and
+  the selected detail verification status, ordered by version descending and
+  priority under_review -> pending_review -> verified -> rejected.
+- Instructor 2FA: PATCH /instructor/api/v1/2fa accepts a strict boolean and
+  returns already-enabled/disabled or enabled/disabled-successfully messages.
+- Instructor professional info: POST /instructor/api/v1/professional_info is
+  protected, resolves the latest InstructorDetail, creates a ProfessionalInfo
+  row from the Pydantic payload, and returns the payload; existing records return
+  403. PATCH applies optional non-null column updates and returns the full row.
+  GET returns the latest detail's ProfessionalInfo. Missing details or records
+  return 404.
 - Instructor profile picture: POST /instructor/api/v1/profile-pic is protected
   and multipart with exactly one .jpg/.jpeg profile_pic field and no extras.
   It creates a UUID key/URL when none exists, otherwise overwrites the existing
@@ -1448,20 +1487,16 @@ Important Context
 - EmailProvider raises ProviderError for payload/rendering/message-building
   failures and ProviderServiceNotAvailableError for SendGrid client or non-2xx
   response failures.
-- PushProvider sends notification.payload to Kafka topic notification_topic
-  through the KafkaProducer singleton. Kafka errors become
+- PushProvider publishes notification.payload as JSON to the Redis pub/sub
+  channel named by notification_topic. Redis errors become
   ProviderServiceNotAvailableError.
 - SMSProvider sends notification.payload through termii-client
   messaging.send, fills from/type/channel defaults from Termii settings, and
   uses NotificationCacheMixin before and after delivery.
-- WebSocket route /notification requires ?token=<access token>.
-  authenticate_user loads Redis session:<sessionId>, sets websocket.state.user,
-  and closes with 1008 for auth/session errors or 1011 for Redis/session data
-  failures.
-- WebsocketNotificationManager keys connections by session id and sends only to
-  CONNECTED sockets with multiple sockets per user.
-- KafkaConsumer reads recipient_id/message from notification_topic payloads,
-  sends through the WebSocket manager, and commits each offset.
+- GET /notification/push is protected and streams text/event-stream data from
+  the notification_topic Redis channel. Messages are filtered by recipient_id
+  (user_id fallback); malformed and non-matching messages are skipped. The
+  pubsub connection is unsubscribed and closed on disconnect.
 - Processed notification cache key:
   notification:processed:<type>:<notification_id>; value "processed"; TTL 240
   seconds. Cache errors fail open.

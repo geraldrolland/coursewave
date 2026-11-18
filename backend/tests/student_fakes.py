@@ -25,6 +25,9 @@ class FakeScalarResult:
     def scalar_one_or_none(self) -> Any:
         return self.value
 
+    def first(self) -> Any:
+        return self.value
+
 
 class FakeMinio:
     """In-memory MinIO client double for profile-picture tests."""
@@ -87,6 +90,10 @@ class FakeStudentSession:
         self.flush_error: Exception | None = None
 
     async def execute(self, statement: Any) -> FakeScalarResult:
+        self.executed.append(statement)
+        return FakeScalarResult(self.student)
+
+    async def exec(self, statement: Any) -> FakeScalarResult:
         self.executed.append(statement)
         return FakeScalarResult(self.student)
 

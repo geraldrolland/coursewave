@@ -49,6 +49,9 @@ class FakeScalarResult:
     def scalar_one_or_none(self) -> Any:
         return self.value
 
+    def first(self) -> Any:
+        return self.value
+
 
 class FakeSession:
     """Minimal async session double for instructor login routes."""
@@ -65,6 +68,9 @@ class FakeSession:
         self.commit_error = commit_error
 
     async def execute(self, statement: Any) -> FakeScalarResult:
+        return FakeScalarResult(self.instructor)
+
+    async def exec(self, statement: Any) -> FakeScalarResult:
         return FakeScalarResult(self.instructor)
 
     def add(self, model: Any) -> None:

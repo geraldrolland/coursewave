@@ -10,8 +10,9 @@ from uuid import UUID
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import or_, select
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.base_config import get_settings
@@ -94,19 +95,19 @@ async def load_due_outbox_ids(
 
     now = utc_now()
     async with session_factory() as session:
-        result = await session.execute(
+        result = await session.exec(
             select(Outbox.id)
             .where(
-                Outbox.status == OutboxStatus.PENDING,
+                col(Outbox.status) == OutboxStatus.PENDING,
                 or_(
-                    Outbox.retry_after.is_(None),
-                    Outbox.retry_after < now,
+                    col(Outbox.retry_after).is_(None),
+                    col(Outbox.retry_after) < now,
                 ),
             )
-            .order_by(Outbox.id)
+            .order_by(col(Outbox.id))
             .limit(limit)
         )
-        return list(result.scalars().all())
+        return list(result.all())
 
 
 async def _mark_referenced_failed(

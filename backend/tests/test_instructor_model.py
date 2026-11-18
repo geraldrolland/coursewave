@@ -1,38 +1,23 @@
 """Tests for the instructor database models."""
 
+from datetime import date
 from uuid import UUID
 
-from sqlalchemy import JSON
+from sqlalchemy import JSON, Date, Text
 
 from app.services.instructor.model import (
     AuthMethod,
-    Degree,
+    DegreeType,
     Education,
-    Experience,
     Gender,
     Instructor,
-    InstructorProfile,
+    InstructorDetail,
+    InstructorVerificationStatus,
+    Onboard,
+    OnboardingStatus,
     PaymentInfo,
+    ProfessionalInfo,
 )
-
-
-def make_profile(instructor_id: UUID) -> InstructorProfile:
-    """Build an instructor profile with all required fields."""
-
-    return InstructorProfile(
-        instructor_id=instructor_id,
-        first_name="Ada",
-        last_name="Lovelace",
-        gender=Gender.FEMALE,
-        country_of_residence="United Kingdom",
-        city="London",
-        bio="Mathematician and writer.",
-        headline="Software engineer",
-        expertise=["tech", "science"],
-        years_of_exp=10,
-        current_occupation="Engineer",
-        company="CourseWave",
-    )
 
 
 def test_instructor_defaults_and_constraints() -> None:
@@ -49,7 +34,7 @@ def test_instructor_defaults_and_constraints() -> None:
     assert instructor.role == "instructor"
     assert instructor.profile_pic_url is None
     assert instructor.cover_image_url is None
-    assert instructor.profile is None
+    assert not hasattr(instructor, "profile")
     assert table.c.role.nullable is False
     assert table.c.email.nullable is False
     assert table.c.email.unique is True
@@ -58,86 +43,63 @@ def test_instructor_defaults_and_constraints() -> None:
     assert table.c.profile_pic_url.type.length == 2048
     assert table.c.cover_image_url.nullable is True
     assert table.c.cover_image_url.type.length == 2048
-    assert table.c.profile.nullable is True
-    assert isinstance(table.c.profile.type, JSON)
+    assert "profile" not in table.c
     assert table.c.auth_method.nullable is False
     assert table.c.auth_method.type.name == "instructor_auth_method"
 
 
-def test_instructor_profile_defaults_and_constraints() -> None:
-    instructor = Instructor(
-        email="ada@example.com",
-        password_hash=None,
+def make_onboard(instructor_id: UUID) -> Onboard:
+    """Build an onboarding record with its default fields."""
+
+    return Onboard(instructor_id=instructor_id)
+
+
+def make_instructor_detail(
+    instructor_id: UUID,
+) -> InstructorDetail:
+    """Build an instructor detail with its default fields."""
+
+    return InstructorDetail(instructor_id=instructor_id)
+
+
+def make_professional_info(
+    instructor_id: UUID,
+    instructor_detail_id: UUID,
+) -> ProfessionalInfo:
+    """Build professional info with all required fields."""
+
+    return ProfessionalInfo(
+        instructor_id=instructor_id,
+        instructor_detail_id=instructor_detail_id,
+        first_name="Ada",
+        last_name="Lovelace",
+        gender=Gender.FEMALE,
+        country_of_residence="United Kingdom",
+        state="England",
+        city="London",
+        bio="Mathematician and writer.",
+        headline="Software engineer",
+        expertise=["tech", "science"],
+        years_of_exp=10,
+        current_occupation="Engineer",
+        social_links=[
+            {"linkedin": "https://www.linkedin.com/in/ada"},
+        ],
     )
-    profile = make_profile(instructor.instructor_id)
-    table = InstructorProfile.__table__
-
-    assert isinstance(profile.profile_id, UUID)
-    assert profile.middle_name is None
-    assert profile.state is None
-    assert profile.social_links is None
-    assert profile.expertise == ["tech", "science"]
-    assert profile.gender is Gender.FEMALE
-    assert Gender.MALE.value == "male"
-    assert Gender.FEMALE.value == "female"
-    assert table.c.profile_id.primary_key is True
-    assert table.c.instructor_id.unique is True
-    assert table.c.instructor_id.nullable is False
-    assert table.c.gender.nullable is False
-    assert table.c.gender.type.name == "instructor_gender"
-    assert table.c.middle_name.nullable is True
-    assert table.c.state.nullable is True
-    assert table.c.company.nullable is True
-    assert table.c.social_links.nullable is True
-    assert table.c.bio.type.length == 1000
-    assert isinstance(table.c.expertise.type, JSON)
-    assert isinstance(table.c.social_links.type, JSON)
-    for column_name in (
-        "first_name",
-        "last_name",
-        "gender",
-        "country_of_residence",
-        "city",
-        "bio",
-        "headline",
-        "expertise",
-        "years_of_exp",
-        "current_occupation",
-    ):
-        assert table.c[column_name].nullable is False
-
-    foreign_key = next(iter(table.c.instructor_id.foreign_keys))
-    assert foreign_key.target_fullname == "instructor.instructor_id"
 
 
 def make_education(
     instructor_id: UUID,
-    graduate_at: str = "09/2024",
+    instructor_detail_id: UUID,
 ) -> Education:
     """Build an education record with all required fields."""
 
     return Education(
         instructor_id=instructor_id,
-        school="University of London",
-        course="Computer Science",
-        degree=Degree.BACHELOR,
-        graduate_at=graduate_at,
-    )
-
-
-def make_experience(
-    instructor_id: UUID,
-    started_at: str = "09/2024",
-    ended_at: str | None = None,
-) -> Experience:
-    """Build an experience record with all required fields."""
-
-    return Experience(
-        instructor_id=instructor_id,
-        company_name="CourseWave",
-        started_at=started_at,
-        ended_at=ended_at,
-        role="Software Engineer",
+        instructor_detail_id=instructor_detail_id,
+        institution_name="University of London",
+        degree_type=DegreeType.BACHELORS,
+        field_of_study="Computer Science",
     )
 
 
@@ -152,49 +114,230 @@ def make_payment_info(instructor_id: UUID) -> PaymentInfo:
     )
 
 
-def test_education_defaults_and_constraints() -> None:
+def test_onboard_defaults_and_constraints() -> None:
     instructor = Instructor(email="ada@example.com")
-    education = make_education(instructor.instructor_id)
-    table = Education.__table__
+    onboard = make_onboard(instructor.instructor_id)
+    table = Onboard.__table__
 
-    assert isinstance(education.education_id, UUID)
-    assert education.degree is Degree.BACHELOR
-    assert education.graduate_at == "09/2024"
-    assert Degree.DOCTORATE.value == "doctorate"
-    assert Degree.MASTERS.value == "masters"
-    assert Degree.BACHELOR.value == "bachelor"
-    assert Degree.ASSOCIATE.value == "associate"
-    assert Degree.DIPLOMA.value == "diploma"
-    assert table.c.education_id.primary_key is True
+    assert isinstance(onboard.id, UUID)
+    assert onboard.is_onboarded is False
+    assert onboard.onboarding_status is OnboardingStatus.NOT_STARTED
+    assert onboard.onboarding_step == 0
+    assert onboard.onboarding_started_at is None
+    assert onboard.onboarding_completed_at is None
+    assert OnboardingStatus.NOT_STARTED.value == "not_started"
+    assert OnboardingStatus.IN_PROGRESS.value == "in_progress"
+    assert OnboardingStatus.COMPLETED.value == "completed"
+
+    assert table.c.id.primary_key is True
     assert table.c.instructor_id.unique is True
     assert table.c.instructor_id.nullable is False
-    assert table.c.degree.nullable is False
-    assert table.c.degree.type.name == "education_degree"
-    for column_name in ("school", "course", "degree", "graduate_at"):
-        assert table.c[column_name].nullable is False
+    assert table.c.instructor_id.index is True
+    assert table.c.is_onboarded.nullable is False
+    assert table.c.onboarding_status.nullable is False
+    assert table.c.onboarding_status.type.name == "onboarding_status"
+    assert table.c.onboarding_step.nullable is False
+    assert table.c.onboarding_started_at.nullable is True
+    assert table.c.onboarding_completed_at.nullable is True
+    assert not hasattr(Instructor, "onboard")
 
     foreign_key = next(iter(table.c.instructor_id.foreign_keys))
     assert foreign_key.target_fullname == "instructor.instructor_id"
 
 
-def test_experience_defaults_and_constraints() -> None:
+def test_instructor_detail_defaults_and_constraints() -> None:
     instructor = Instructor(email="ada@example.com")
-    experience = make_experience(instructor.instructor_id)
-    table = Experience.__table__
+    detail = make_instructor_detail(instructor.instructor_id)
+    table = InstructorDetail.__table__
 
-    assert isinstance(experience.experience_id, UUID)
-    assert experience.ended_at is None
-    assert experience.till_present is False
-    assert table.c.experience_id.primary_key is True
+    assert isinstance(detail.id, UUID)
+    assert detail.version == 1
+    assert (
+        detail.verification_status
+        is InstructorVerificationStatus.PENDING_REVIEW
+    )
+    assert (
+        InstructorVerificationStatus.PENDING_REVIEW.value
+        == "pending_review"
+    )
+    assert (
+        InstructorVerificationStatus.UNDER_REVIEW.value
+        == "under_review"
+    )
+    assert InstructorVerificationStatus.REJECTED.value == "rejected"
+    assert InstructorVerificationStatus.VERIFIED.value == "verified"
+
+    assert table.c.id.primary_key is True
     assert table.c.instructor_id.unique is not True
     assert table.c.instructor_id.nullable is False
-    assert table.c.ended_at.nullable is True
-    assert table.c.till_present.nullable is False
-    for column_name in ("company_name", "started_at", "role"):
+    assert table.c.instructor_id.index is True
+    assert table.c.verification_status.nullable is False
+    assert (
+        table.c.verification_status.type.name
+        == "instructor_detail_verification_status"
+    )
+    assert table.c.version.nullable is False
+
+    for column_name in ("created_at", "updated_at"):
         assert table.c[column_name].nullable is False
 
     foreign_key = next(iter(table.c.instructor_id.foreign_keys))
     assert foreign_key.target_fullname == "instructor.instructor_id"
+
+
+def test_professional_info_defaults_and_constraints() -> None:
+    instructor = Instructor(email="ada@example.com")
+    detail = make_instructor_detail(instructor.instructor_id)
+    info = make_professional_info(instructor.instructor_id, detail.id)
+    table = ProfessionalInfo.__table__
+
+    assert isinstance(info.id, UUID)
+    assert info.middle_name is None
+    assert info.company is None
+    assert info.gender is Gender.FEMALE
+    assert Gender.MALE.value == "male"
+    assert Gender.FEMALE.value == "female"
+    assert info.expertise == ["tech", "science"]
+    assert info.social_links == [
+        {"linkedin": "https://www.linkedin.com/in/ada"},
+    ]
+
+    assert table.c.id.primary_key is True
+    assert table.c.instructor_id.nullable is False
+    assert table.c.instructor_id.index is True
+    assert table.c.instructor_detail_id.unique is True
+    assert table.c.instructor_detail_id.nullable is False
+    assert table.c.instructor_detail_id.index is True
+    assert table.c.gender.nullable is False
+    assert table.c.gender.type.name == "professional_info_gender"
+    assert table.c.middle_name.nullable is True
+    assert table.c.company.nullable is True
+    assert isinstance(table.c.expertise.type, JSON)
+    assert isinstance(table.c.social_links.type, JSON)
+    assert table.c.social_links.nullable is False
+
+    for column_name in (
+        "first_name",
+        "last_name",
+        "gender",
+        "country_of_residence",
+        "state",
+        "city",
+        "bio",
+        "headline",
+        "expertise",
+        "years_of_exp",
+        "current_occupation",
+        "social_links",
+        "created_at",
+        "updated_at",
+    ):
+        assert table.c[column_name].nullable is False
+
+    instructor_foreign_key = next(
+        iter(table.c.instructor_id.foreign_keys)
+    )
+    assert (
+        instructor_foreign_key.target_fullname
+        == "instructor.instructor_id"
+    )
+    detail_foreign_key = next(
+        iter(table.c.instructor_detail_id.foreign_keys)
+    )
+    assert detail_foreign_key.target_fullname == "instructor_detail.id"
+
+
+def test_education_defaults_and_constraints() -> None:
+    instructor = Instructor(email="ada@example.com")
+    detail = make_instructor_detail(instructor.instructor_id)
+    education = make_education(
+        instructor.instructor_id,
+        detail.id,
+    )
+    table = Education.__table__
+
+    assert isinstance(education.id, UUID)
+    assert education.degree_type is DegreeType.BACHELORS
+    assert education.major is None
+    assert education.minor is None
+    assert education.start_date is None
+    assert education.end_date is None
+    assert education.is_currently_studying is False
+    assert education.grade is None
+    assert education.description is None
+
+    assert DegreeType.HIGH_SCHOOL.value == "high_school"
+    assert DegreeType.DIPLOMA.value == "diploma"
+    assert DegreeType.ASSOCIATE.value == "associate"
+    assert DegreeType.BACHELORS.value == "bachelors"
+    assert (
+        DegreeType.POSTGRADUATE_DIPLOMA.value
+        == "postgraduate_diploma"
+    )
+    assert DegreeType.MASTERS.value == "masters"
+    assert DegreeType.DOCTORATE.value == "doctorate"
+    assert (
+        DegreeType.PROFESSIONAL_CERTIFICATION.value
+        == "professional_certification"
+    )
+    assert DegreeType.OTHER.value == "other"
+
+    assert table.c.id.primary_key is True
+    assert table.c.instructor_id.nullable is False
+    assert table.c.instructor_id.index is True
+    assert table.c.instructor_detail_id.unique is True
+    assert table.c.instructor_detail_id.nullable is False
+    assert table.c.instructor_detail_id.index is True
+    assert table.c.degree_type.nullable is False
+    assert table.c.degree_type.type.name == "education_degree_type"
+    assert table.c.is_currently_studying.nullable is False
+    for column_name in (
+        "institution_name",
+        "degree_type",
+        "field_of_study",
+        "is_currently_studying",
+    ):
+        assert table.c[column_name].nullable is False
+
+    for column_name in (
+        "major",
+        "minor",
+        "start_date",
+        "end_date",
+        "grade",
+        "description",
+    ):
+        assert table.c[column_name].nullable is True
+
+    assert isinstance(table.c.start_date.type, Date)
+    assert isinstance(table.c.end_date.type, Date)
+    assert isinstance(table.c.description.type, Text)
+
+    education_with_dates = Education(
+        instructor_id=instructor.instructor_id,
+        instructor_detail_id=detail.id,
+        institution_name="University of London",
+        degree_type=DegreeType.MASTERS,
+        field_of_study="Computer Science",
+        start_date=date(2020, 9, 1),
+        end_date=date(2022, 6, 30),
+        is_currently_studying=True,
+    )
+    assert education_with_dates.start_date == date(2020, 9, 1)
+    assert education_with_dates.end_date == date(2022, 6, 30)
+    assert education_with_dates.is_currently_studying is True
+
+    instructor_foreign_key = next(
+        iter(table.c.instructor_id.foreign_keys)
+    )
+    assert (
+        instructor_foreign_key.target_fullname
+        == "instructor.instructor_id"
+    )
+    detail_foreign_key = next(
+        iter(table.c.instructor_detail_id.foreign_keys)
+    )
+    assert detail_foreign_key.target_fullname == "instructor_detail.id"
 
 
 def test_payment_info_defaults_and_constraints() -> None:

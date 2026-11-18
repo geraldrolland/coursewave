@@ -2,10 +2,9 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Column, DateTime, JSON, Enum as SAEnum, func
+from sqlalchemy import Column, DateTime, Enum as SAEnum, func
 from sqlmodel import Field, SQLModel
 
 from app.base_utils import utc_now
@@ -37,10 +36,6 @@ class Instructor(SQLModel, table=True):
     password_hash: str | None = Field(default=None, max_length=255)
     profile_pic_url: str | None = Field(default=None, max_length=2048)
     cover_image_url: str | None = Field(default=None, max_length=2048)
-    profile: dict[str, Any] | None = Field(
-        default=None,
-        sa_column=Column(JSON, nullable=True),
-    )
     auth_method: AuthMethod = Field(
         default=AuthMethod.EMAIL,
         sa_column=Column(

@@ -57,9 +57,6 @@ class Settings(BaseSettings):
     sendgrid_from_name: str = "CourseWave"
 
     notification_topic: str = "notification"
-    kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_consumer_enabled: bool = False
-    kafka_consumer_group_id: str = "coursewave-notification-websockets"
 
     termii_api_key: str = "TERMII_API_KEY_PLACEHOLDER"
     termii_sender_id: str = "TERMII_SENDER_ID_PLACEHOLDER"

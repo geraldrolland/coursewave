@@ -1,8 +1,7 @@
 """FastAPI application for the CourseWave service."""
 
-import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from minio import Minio
@@ -22,17 +21,19 @@ from app.middleware.request_logger import RequestLoggerMiddleware
 from app.redis_config import create_redis_client
 from app.services.instructor.model import (  # noqa: F401
     Education,
-    Experience,
     Instructor,
-    InstructorProfile,
+    InstructorDetail,
+    Onboard,
     PaymentInfo,
+    ProfessionalInfo,
 )
 from app.services.instructor.router.instructor import (
     router as instructor_router,
 )
 from app.services.notification.model import Notification  # noqa: F401
-from app.services.notification.pub_sub.kafka import KafkaConsumer
-from app.services.notification.ws import router as notification_ws_router
+from app.services.notification.router import (
+    router as notification_router,
+)
 from app.services.outbox.model import Outbox  # noqa: F401
 from app.services.storage.minio import create_minio_client
 from app.services.student.model import Student  # noqa: F401
@@ -54,16 +55,6 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         """Initialize and release application resources."""
 
-        kafka_consumer: KafkaConsumer | None = None
-        kafka_task: asyncio.Task[None] | None = None
-        if settings.kafka_consumer_enabled:
-            kafka_consumer = KafkaConsumer(
-                topic=settings.notification_topic,
-                bootstrap_servers=settings.kafka_bootstrap_servers,
-                group_id=settings.kafka_consumer_group_id,
-            )
-            kafka_task = asyncio.create_task(kafka_consumer.run())
-
         try:
             if settings.auto_create_tables:
                 async with create_postgresql_engine().begin() as connection:
@@ -71,13 +62,6 @@ def create_app(
 
             yield
         finally:
-            if kafka_task is not None:
-                kafka_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await kafka_task
-            if kafka_consumer is not None:
-                await kafka_consumer.aclose()
-
             await app.state.redis.aclose()
             await create_postgresql_engine().dispose()
             create_postgresql_engine.cache_clear()
@@ -106,7 +90,7 @@ def create_app(
 
     app.include_router(student_router)
     app.include_router(instructor_router)
-    app.include_router(notification_ws_router)
+    app.include_router(notification_router)
 
     # add_middleware is LIFO: the last added middleware runs first.
     # Effective flow: CORS -> RequestLogger -> Auth -> RateLimit ->

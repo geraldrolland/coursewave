@@ -21,6 +21,7 @@ from minio import Minio
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 from sqlalchemy.exc import IntegrityError
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.base_config import Settings
@@ -36,8 +37,18 @@ from app.services.instructor.google import (
     exchange_code_for_access_token,
     fetch_google_user_info,
 )
-from app.services.instructor.model import AuthMethod, Instructor
+from app.services.instructor.model import (
+    AuthMethod,
+    Instructor,
+    InstructorDetail,
+    InstructorVerificationStatus,
+    Onboard,
+)
+from app.services.instructor.router.professional_info import (
+    router as professional_info_router,
+)
 from app.services.instructor.schema import (
+    Instructor2FAUpdateRequest,
     InstructorCoverImageForm,
     InstructorCoverImageResponse,
     InstructorEmailRequest,
@@ -45,11 +56,10 @@ from app.services.instructor.schema import (
     InstructorLoginResponse,
     InstructorMeResponse,
     InstructorMessageResponse,
+    InstructorOverviewResponse,
     InstructorPasswordResetRequest,
-    InstructorProfileCreateRequest,
     InstructorProfilePicForm,
     InstructorProfilePicResponse,
-    InstructorProfileUpdateRequest,
     InstructorRegisterRequest,
     InstructorRegisterResponse,
     InstructorResendOtpRequest,
@@ -116,8 +126,114 @@ PROFILE_PICTURE_NOT_SET = "Profile picture is not set"
 COVER_IMAGE_UNAVAILABLE = "Cover image service unavailable"
 COVER_IMAGE_DELETED = "Cover image deleted successfully"
 COVER_IMAGE_NOT_SET = "Cover image is not set"
-PROFILE_ALREADY_EXISTS = "Instructor profile already exists"
-PROFILE_NOT_FOUND = "Instructor profile not found"
+INSTRUCTOR_DETAIL_NOT_FOUND = "Instructor detail not found"
+TWO_FA_ALREADY_ENABLED = "2FA already enabled"
+TWO_FA_ALREADY_DISABLED = "2FA already disabled"
+TWO_FA_ENABLED = "2FA enabled successfully"
+TWO_FA_DISABLED = "2FA disabled successfully"
+
+router.include_router(professional_info_router)
+
+
+@router.get(
+    "/",
+    response_model=InstructorOverviewResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_instructor_overview(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorOverviewResponse:
+    """Return instructor identity and the highest-priority detail status."""
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    result = await session.exec(
+        select(InstructorDetail)
+        .where(col(InstructorDetail.instructor_id) == instructor_id)
+        .order_by(col(InstructorDetail.version).desc())
+    )
+    details = list(result.all())
+    if not details:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_DETAIL_NOT_FOUND,
+        )
+
+    priority = (
+        InstructorVerificationStatus.UNDER_REVIEW,
+        InstructorVerificationStatus.PENDING_REVIEW,
+        InstructorVerificationStatus.VERIFIED,
+        InstructorVerificationStatus.REJECTED,
+    )
+    selected_detail = next(
+        (
+            detail
+            for verification_status in priority
+            for detail in details
+            if detail.verification_status is verification_status
+        ),
+        None,
+    )
+    if selected_detail is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_DETAIL_NOT_FOUND,
+        )
+
+    return InstructorOverviewResponse(
+        instructor_id=instructor.instructor_id,
+        email=instructor.email,
+        is_2fa_enabled=instructor.is_2fa_enabled,
+        profile_pic_url=instructor.profile_pic_url,
+        cover_image_url=instructor.cover_image_url,
+        verification_status=selected_detail.verification_status,
+    )
+
+
+@router.patch(
+    "/2fa",
+    response_model=InstructorMessageResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def update_instructor_2fa(
+    payload: Instructor2FAUpdateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> InstructorMessageResponse:
+    """Enable or disable two-factor authentication for an instructor."""
+
+    instructor_id = _authenticated_instructor_id(request)
+    instructor = await session.get(Instructor, instructor_id)
+    if instructor is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=INSTRUCTOR_NOT_FOUND,
+        )
+
+    if instructor.is_2fa_enabled == payload.status:
+        message = (
+            TWO_FA_ALREADY_ENABLED
+            if payload.status
+            else TWO_FA_ALREADY_DISABLED
+        )
+        return InstructorMessageResponse(message=message)
+
+    instructor.is_2fa_enabled = payload.status
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+
+    message = TWO_FA_ENABLED if payload.status else TWO_FA_DISABLED
+    return InstructorMessageResponse(message=message)
 
 
 @router.post(
@@ -156,6 +272,15 @@ async def register_instructor(
         async with session.begin():
             session.add(instructor)
             await session.flush()
+
+            session.add(
+                Onboard(instructor_id=instructor.instructor_id)
+            )
+            session.add(
+                InstructorDetail(
+                    instructor_id=instructor.instructor_id
+                )
+            )
 
             await redis.set(
                 token,
@@ -594,127 +719,6 @@ async def logout(
         build_clear_refresh_cookie(),
     )
     return InstructorMessageResponse(message="Logged out successfully")
-
-
-@router.post(
-    "/profile",
-    response_model=InstructorProfileCreateRequest,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_200_OK,
-)
-async def create_instructor_profile(
-    payload: InstructorProfileCreateRequest,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> InstructorProfileCreateRequest:
-    """Create the authenticated instructor's JSON profile."""
-
-    instructor_id = _authenticated_instructor_id(request)
-    instructor = await session.get(Instructor, instructor_id)
-    if instructor is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=INSTRUCTOR_NOT_FOUND,
-        )
-
-    if instructor.profile is not None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=PROFILE_ALREADY_EXISTS,
-        )
-
-    instructor.profile = payload.model_dump(
-        mode="json",
-        exclude_none=True,
-    )
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise
-
-    return payload
-
-
-@router.get(
-    "/profile",
-    response_model=InstructorProfileCreateRequest,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_200_OK,
-)
-async def get_instructor_profile(
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> InstructorProfileCreateRequest:
-    """Return the authenticated instructor's JSON profile."""
-
-    instructor_id = _authenticated_instructor_id(request)
-    instructor = await session.get(Instructor, instructor_id)
-    if instructor is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=INSTRUCTOR_NOT_FOUND,
-        )
-
-    if instructor.profile is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=PROFILE_NOT_FOUND,
-        )
-
-    return InstructorProfileCreateRequest.model_validate(
-        instructor.profile
-    )
-
-
-@router.patch(
-    "/profile",
-    response_model=InstructorProfileCreateRequest,
-    response_model_exclude_none=True,
-    status_code=status.HTTP_200_OK,
-)
-async def update_instructor_profile(
-    payload: InstructorProfileUpdateRequest,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> InstructorProfileCreateRequest:
-    """Update the authenticated instructor's JSON profile."""
-
-    instructor_id = _authenticated_instructor_id(request)
-    instructor = await session.get(Instructor, instructor_id)
-    if instructor is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=INSTRUCTOR_NOT_FOUND,
-        )
-
-    if instructor.profile is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=PROFILE_NOT_FOUND,
-        )
-
-    updates = payload.model_dump(
-        mode="json",
-        exclude_none=True,
-        exclude_unset=True,
-    )
-    merged_profile = {**instructor.profile, **updates}
-    updated_profile = InstructorProfileCreateRequest.model_validate(
-        merged_profile
-    )
-
-    instructor.profile = updated_profile.model_dump(
-        mode="json",
-        exclude_none=True,
-    )
-    try:
-        await session.commit()
-    except Exception:
-        await session.rollback()
-        raise
-
-    return updated_profile
 
 
 @router.post(

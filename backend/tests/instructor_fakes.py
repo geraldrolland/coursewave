@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from app.base_dependencies import get_session
 from app.main import create_app
 from app.security import hash
-from app.services.instructor.model import Instructor
+from app.services.instructor.model import (
+    Instructor,
+    InstructorDetail,
+    Onboard,
+    ProfessionalInfo,
+)
 from tests.helpers import build_settings
 
 DEFAULT_EMAIL = "ada@example.com"
@@ -25,12 +30,37 @@ class FakeScalarResult:
     def scalar_one_or_none(self) -> Any:
         return self.value
 
+    def first(self) -> Any:
+        if isinstance(self.value, list):
+            return self.value[0] if self.value else None
+        return self.value
+
+    def all(self) -> list[Any]:
+        if isinstance(self.value, list):
+            return list(self.value)
+        return [] if self.value is None else [self.value]
+
 
 class FakeInstructorSession:
     """Minimal async session double for instructor account routes."""
 
-    def __init__(self, instructor: Instructor | None = None) -> None:
+    def __init__(
+        self,
+        instructor: Instructor | None = None,
+        detail: InstructorDetail | None = None,
+        details: list[InstructorDetail] | None = None,
+        onboard: Onboard | None = None,
+        professional_info: ProfessionalInfo | None = None,
+    ) -> None:
         self.instructor = instructor
+        self.detail = detail
+        self.details = (
+            details
+            if details is not None
+            else ([detail] if detail is not None else [])
+        )
+        self.onboard = onboard
+        self.professional_info = professional_info
         self.added: list[Any] = []
         self.executed: list[Any] = []
         self.get_calls: list[tuple[Any, Any]] = []
@@ -38,9 +68,23 @@ class FakeInstructorSession:
         self.rollbacks = 0
         self.commit_error: Exception | None = None
 
+    def _result_for(self, statement: Any) -> FakeScalarResult:
+        entity = statement.column_descriptions[0].get("entity")
+        if entity is InstructorDetail:
+            return FakeScalarResult(self.details)
+        if entity is Onboard:
+            return FakeScalarResult(self.onboard)
+        if entity is ProfessionalInfo:
+            return FakeScalarResult(self.professional_info)
+        return FakeScalarResult(self.instructor)
+
     async def execute(self, statement: Any) -> FakeScalarResult:
         self.executed.append(statement)
-        return FakeScalarResult(self.instructor)
+        return self._result_for(statement)
+
+    async def exec(self, statement: Any) -> FakeScalarResult:
+        self.executed.append(statement)
+        return self._result_for(statement)
 
     async def get(
         self,

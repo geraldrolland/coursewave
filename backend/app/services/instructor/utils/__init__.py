@@ -18,7 +18,7 @@ from minio import Minio
 from pydantic import SecretStr, ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.base_config import Settings
@@ -282,10 +282,10 @@ async def _get_instructor_by_email(
 ) -> Instructor | None:
     """Return the instructor with the given email, if one exists."""
 
-    result = await session.execute(
-        select(Instructor).where(Instructor.email == email)
+    result = await session.exec(
+        select(Instructor).where(col(Instructor.email) == email)
     )
-    return result.scalar_one_or_none()
+    return result.first()
 
 
 async def _get_token_instructor_id(redis: Redis, token: str) -> str | None:

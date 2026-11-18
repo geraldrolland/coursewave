@@ -1,4 +1,4 @@
-"""Instructor profile database model."""
+"""Instructor professional information database model."""
 
 from datetime import datetime
 from enum import Enum
@@ -11,7 +11,7 @@ from app.base_utils import utc_now
 
 
 class Gender(str, Enum):
-    """Supported instructor genders."""
+    """Supported professional-info genders."""
 
     MALE = "male"
     FEMALE = "female"
@@ -23,14 +23,18 @@ def _enum_values(enum_cls: type[Enum]) -> list[str]:
     return [str(member.value) for member in enum_cls]
 
 
-class InstructorProfile(SQLModel, table=True):
-    """Profile details for an instructor."""
+class ProfessionalInfo(SQLModel, table=True):
+    """Professional details for an instructor detail record."""
 
-    __tablename__ = "instructor_profile"
+    __tablename__ = "professional_info"
 
-    profile_id: UUID = Field(default_factory=uuid4, primary_key=True)
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
     instructor_id: UUID = Field(
         foreign_key="instructor.instructor_id",
+        index=True,
+    )
+    instructor_detail_id: UUID = Field(
+        foreign_key="instructor_detail.id",
         unique=True,
         index=True,
     )
@@ -41,14 +45,14 @@ class InstructorProfile(SQLModel, table=True):
         sa_column=Column(
             SAEnum(
                 Gender,
-                name="instructor_gender",
+                name="professional_info_gender",
                 values_callable=_enum_values,
             ),
             nullable=False,
         ),
     )
     country_of_residence: str = Field(max_length=100)
-    state: str | None = Field(default=None, max_length=100)
+    state: str = Field(max_length=100)
     city: str = Field(max_length=100)
     bio: str = Field(max_length=1000)
     headline: str = Field(max_length=255)
@@ -58,9 +62,8 @@ class InstructorProfile(SQLModel, table=True):
     years_of_exp: int = Field()
     current_occupation: str = Field(max_length=255)
     company: str | None = Field(default=None, max_length=255)
-    social_links: list[dict[str, str]] | None = Field(
-        default=None,
-        sa_column=Column(JSON, nullable=True),
+    social_links: list[dict[str, str]] = Field(
+        sa_column=Column(JSON, nullable=False),
     )
     created_at: datetime = Field(
         default_factory=utc_now,
@@ -81,4 +84,4 @@ class InstructorProfile(SQLModel, table=True):
     )
 
 
-__all__ = ["Gender", "InstructorProfile"]
+__all__ = ["Gender", "ProfessionalInfo"]

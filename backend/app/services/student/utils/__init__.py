@@ -16,7 +16,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import SecretStr, ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.base_config import Settings
@@ -189,10 +189,10 @@ async def _get_student_by_email(
 ) -> Student | None:
     """Return the student with the given email, if one exists."""
 
-    result = await session.execute(
-        select(Student).where(Student.email == email)
+    result = await session.exec(
+        select(Student).where(col(Student.email) == email)
     )
-    return result.scalar_one_or_none()
+    return result.first()
 
 
 async def _get_token_user_id(redis: Redis, token: str) -> str | None:

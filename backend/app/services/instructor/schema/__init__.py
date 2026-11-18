@@ -16,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.services.instructor.model import InstructorVerificationStatus
 from app.services.instructor.utils import (
     _normalize_email,
     _normalize_token,
@@ -202,6 +203,25 @@ class InstructorMeResponse(BaseModel):
 
     id: str
     email: EmailStr
+
+
+class InstructorOverviewResponse(BaseModel):
+    """Instructor identity and selected detail verification status."""
+
+    instructor_id: UUID
+    email: EmailStr
+    is_2fa_enabled: bool
+    profile_pic_url: str | None
+    cover_image_url: str | None
+    verification_status: InstructorVerificationStatus
+
+
+class Instructor2FAUpdateRequest(BaseModel):
+    """Payload accepted by the instructor 2FA update endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: bool = Field(strict=True)
 
 
 class InstructorProfilePictureMetadata(BaseModel):
@@ -449,11 +469,13 @@ class InstructorProfileCreateRequest(BaseModel):
 
 
 __all__ = [
+    "Instructor2FAUpdateRequest",
     "InstructorEmailRequest",
     "InstructorLoginRequest",
     "InstructorLoginResponse",
     "InstructorMeResponse",
     "InstructorMessageResponse",
+    "InstructorOverviewResponse",
     "InstructorCoverImageForm",
     "InstructorCoverImageResponse",
     "InstructorPasswordResetRequest",

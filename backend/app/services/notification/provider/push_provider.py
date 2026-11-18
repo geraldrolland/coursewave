@@ -1,4 +1,4 @@
-"""Kafka push notification provider."""
+"""Redis pub/sub push notification provider."""
 
 import json
 import logging
@@ -7,16 +7,13 @@ from typing import TYPE_CHECKING
 from redis import Redis as SyncRedis
 
 from app.base_config import get_settings
+from app.redis_config import create_sync_redis_client
 from app.services.notification.exception import (
     ProviderError,
     ProviderServiceNotAvailableError,
 )
 from app.services.notification.provider.base import BaseProvider
 from app.services.notification.provider.cache_mixin import NotificationCacheMixin
-from app.services.notification.pub_sub.kafka.kafka_producer import (
-    KafkaProducer,
-    kafka_producer,
-)
 
 if TYPE_CHECKING:
     from app.services.notification.model import Notification
@@ -25,20 +22,25 @@ logger = logging.getLogger("notification.provider.push")
 
 
 class PushProvider(NotificationCacheMixin, BaseProvider):
-    """Publish push notifications to the configured Kafka topic."""
+    """Publish push notifications to a Redis channel."""
 
     def __init__(
         self,
-        producer: KafkaProducer | None = None,
         redis_client: SyncRedis | None = None,
     ) -> None:
         settings = get_settings()
-        self.topic = settings.notification_topic
-        self._producer = producer or kafka_producer
+        self.channel = settings.notification_topic
         self._redis_client = redis_client
 
+    def _get_publisher(self) -> SyncRedis:
+        """Return the Redis client used for publishing."""
+
+        if self._redis_client is None:
+            self._redis_client = create_sync_redis_client(get_settings())
+        return self._redis_client
+
     def process(self, notification: "Notification") -> None:
-        """Publish the notification payload to Kafka."""
+        """Publish the notification payload to the configured Redis channel."""
 
         if self.is_notification_cached(notification):
             logger.info(
@@ -64,7 +66,10 @@ class PushProvider(NotificationCacheMixin, BaseProvider):
             raise ProviderError("Push notification processing failed") from exc
 
         try:
-            self._producer.send(self.topic, payload)
+            self._get_publisher().publish(
+                self.channel,
+                json.dumps(payload),
+            )
         except Exception as exc:
             raise ProviderServiceNotAvailableError(
                 "Push provider service is unavailable"
@@ -72,9 +77,9 @@ class PushProvider(NotificationCacheMixin, BaseProvider):
 
         self.cache_notification(notification)
         logger.info(
-            "Notification %s published to Kafka topic %s",
+            "Notification %s published to Redis channel %s",
             notification.notification_id,
-            self.topic,
+            self.channel,
         )
 
 

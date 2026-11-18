@@ -2,8 +2,8 @@
 
 CourseWave is a student platform built around a FastAPI backend, PostgreSQL,
 Redis, RabbitMQ, MinIO, and Celery workers for asynchronous notification
-delivery. Kafka is used for push notification fan-out and authenticated
-WebSocket delivery through an external broker.
+delivery. Redis pub/sub is used for push notification fan-out and authenticated
+Server-Sent Events delivery.
 
 ## Services
 
@@ -36,7 +36,7 @@ behavior, student and instructor registration, login, Google authentication,
 current-session lookup, logout, profile lookup and updates, MinIO-backed profile
 pictures, email verification, password reset, the authentication and
 refresh-token contracts, the notification task flow and queue topology, email
-template rendering, notification providers, authenticated WebSocket
+template rendering, notification providers, authenticated SSE push
 notifications, and testing instructions.
 
 ## Tests

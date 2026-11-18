@@ -71,6 +71,10 @@ class FakeSession:
         self.executed.append(statement)
         return FakeScalarResult(self.due_ids)
 
+    async def exec(self, statement: Any) -> FakeScalarResult:
+        self.executed.append(statement)
+        return FakeScalarResult(self.due_ids)
+
     async def get(
         self,
         model: type[Any],
