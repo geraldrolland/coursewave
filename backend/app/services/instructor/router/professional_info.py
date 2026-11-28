@@ -37,14 +37,17 @@ async def _get_latest_instructor_detail(
     session: AsyncSession,
     instructor_id: UUID,
 ) -> InstructorDetail | None:
-    """Return the instructor's most recently created detail record."""
+    """Return the instructor's highest-version detail record."""
 
     result = await session.exec(
         select(InstructorDetail)
         .where(
             col(InstructorDetail.instructor_id) == instructor_id
         )
-        .order_by(col(InstructorDetail.created_at).desc())
+        .order_by(
+            col(InstructorDetail.version).desc(),
+            col(InstructorDetail.created_at).desc(),
+        )
         .limit(1)
     )
     return result.first()

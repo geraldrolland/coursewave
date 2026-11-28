@@ -156,6 +156,11 @@ def test_create_professional_info_uses_latest_detail() -> None:
     assert session.commits == 1
     statements = [str(statement) for statement in session.executed]
     assert any(
+        "order by instructor_detail.version desc, "
+        "instructor_detail.created_at desc" in statement.lower()
+        for statement in statements
+    )
+    assert any(
         "onboard" in statement and "FOR UPDATE" in statement
         for statement in statements
     )

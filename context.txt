@@ -519,7 +519,8 @@ Instructor Overview and 2FA
 Instructor Professional Info
 - POST /instructor/api/v1/professional_info is protected and accepts the
   Pydantic profile payload.
-- The endpoint resolves the instructor's latest InstructorDetail by created_at.
+- The endpoint resolves the instructor's latest InstructorDetail by version
+  descending, with created_at descending as the tie-breaker.
   Missing instructors return 404 "Instructor not found"; missing detail records
   return 404 "Instructor detail not found".
 - It creates a ProfessionalInfo row with the payload columns, Gender enum,
@@ -917,6 +918,8 @@ Completed
 - Professional-info POST now locks the instructor's Onboard row with
   SELECT FOR UPDATE, increments onboarding_step, moves not_started to
   in_progress, and marks completed/is_onboarded=true when the step reaches 6.
+- Professional-info endpoints now resolve the latest InstructorDetail by version
+  descending, using created_at descending only as a tie-breaker.
 - Added minio_cover_bucket (coverimages), MINIO_COVER_BUCKET environment
   examples, Compose environment, and coverimages bucket creation in minio-init.
 - Removed the separate InstructorProfile model/table.
